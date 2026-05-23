@@ -28,6 +28,7 @@ pub struct ElevenLabsConfig {
     pub output_format: String,
     pub stability:     f32,
     pub similarity:    f32,
+    pub speed:         f32,
     pub endpoint:      String,
 }
 
@@ -40,6 +41,7 @@ impl ElevenLabsConfig {
             output_format: "pcm_24000".into(),
             stability:     0.5,
             similarity:    0.8,
+            speed:         0.85,
             endpoint:      "wss://api.elevenlabs.io/v1/text-to-speech".into(),
         }
     }
@@ -106,6 +108,7 @@ async fn run_persistent_connection(
         "voice_settings": {
             "stability":        cfg.stability,
             "similarity_boost": cfg.similarity,
+            "speed":            cfg.speed,
             "use_speaker_boost": false
         },
         "generation_config": {

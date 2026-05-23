@@ -53,6 +53,7 @@ pub const SUPPORTED_LANGS: &[(&str, &str)] = &[
     ("EN", "English"),
     ("DE", "German"),
     ("NL", "Dutch"),
+    ("ET", "Estonian"),
     ("IT", "Italian"),
     ("ES", "Spanish"),
     ("FR", "French"),
