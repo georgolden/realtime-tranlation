@@ -30,6 +30,9 @@ pub struct ElevenLabsConfig {
     pub similarity:    f32,
     pub speed:         f32,
     pub endpoint:      String,
+    /// Output gain multiplier applied to decoded PCM samples.
+    /// 1.0 = unity, 1.4 = ~3 dB boost.
+    pub gain:          f32,
 }
 
 impl ElevenLabsConfig {
@@ -41,8 +44,9 @@ impl ElevenLabsConfig {
             output_format: "pcm_24000".into(),
             stability:     0.5,
             similarity:    0.8,
-            speed:         0.85,
+            speed:         0.80,
             endpoint:      "wss://api.elevenlabs.io/v1/text-to-speech".into(),
+            gain:          1.4,
         }
     }
 
@@ -101,6 +105,7 @@ async fn run_persistent_connection(
     log::info!("ElevenLabs: connected");
 
     let (mut ws_sink, mut ws_stream) = ws.split();
+    let gain = cfg.gain;
 
     // Init message — must be first.
     let init = serde_json::json!({
@@ -163,7 +168,8 @@ async fn run_persistent_connection(
                         };
 
                         if let Some(b64) = v.get("audio").and_then(|a| a.as_str()) {
-                            if let Some(samples) = decode_pcm(b64) {
+                            if let Some(mut samples) = decode_pcm(b64) {
+                                apply_gain(&mut samples, gain);
                                 let _ = pcm_tx.send(Some(samples)).await;
                             }
                         }
@@ -177,9 +183,10 @@ async fn run_persistent_connection(
                     }
                     Some(Ok(Message::Binary(b))) => {
                         if !b.is_empty() {
-                            let samples: Vec<f32> = b.chunks_exact(2)
+                            let mut samples: Vec<f32> = b.chunks_exact(2)
                                 .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
                                 .collect();
+                            apply_gain(&mut samples, gain);
                             let _ = pcm_tx.send(Some(samples)).await;
                         }
                     }
@@ -211,7 +218,8 @@ async fn run_persistent_connection(
     {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
         if let Some(b64) = v.get("audio").and_then(|a| a.as_str()) {
-            if let Some(samples) = decode_pcm(b64) {
+            if let Some(mut samples) = decode_pcm(b64) {
+                apply_gain(&mut samples, gain);
                 let _ = pcm_tx.send(Some(samples)).await;
             }
         }
@@ -229,6 +237,15 @@ fn decode_pcm(b64: &str) -> Option<Vec<f32>> {
             .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
             .collect()
     )
+}
+
+fn apply_gain(samples: &mut [f32], gain: f32) {
+    if (gain - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    for s in samples.iter_mut() {
+        *s = (*s * gain).clamp(-1.0, 1.0);
+    }
 }
 
 #[cfg(test)]

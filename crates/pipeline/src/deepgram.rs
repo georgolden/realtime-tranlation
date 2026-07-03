@@ -1,9 +1,11 @@
 //! Deepgram streaming-STT client.
 //!
 //! One persistent WebSocket connection per track. Audio in (i16 LE @
-//! 16 kHz mono), JSON events out. Every committed `is_final` chunk is
-//! forwarded directly to the translation layer — no local buffering.
-//! DeepL's context window provides coherence across fragment boundaries.
+//! 16 kHz mono), JSON events out. `is_final` segments are accumulated
+//! into a local buffer and flushed only when Deepgram signals
+//! `speech_final: true` (end of utterance) or on a fallback
+//! `UtteranceEnd` event. This trades latency for higher-quality
+//! sentences instead of fragmenting every `is_final` word-by-word.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +22,20 @@ use tokio_tungstenite::{
 
 use crate::events::{PipelineEvent, TrackId};
 use crate::PipelineError;
+
+/// Controls when Deepgram transcripts are flushed to the translation layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushMode {
+    /// Accumulate intermediate `is_final` segments, flush only on
+    /// `speech_final: true` or `UtteranceEnd`. Produces complete
+    /// sentences at the cost of higher latency. Best for STT → translate
+    /// → TTS pipelines where quality matters more than immediacy.
+    SpeechFinal,
+    /// Flush immediately on every `is_final: true`. Lowest latency,
+    /// word-by-word output. Best for subtitle overlays where the user
+    /// needs to see words as soon as they're spoken.
+    IsFinal,
+}
 
 #[derive(Debug, Clone)]
 pub struct DeepgramConfig {
@@ -41,6 +57,9 @@ pub struct DeepgramConfig {
     pub punctuate:         bool,     // true
     /// Per spec, `endpoint=wss://api.deepgram.com/v1/listen`.
     pub endpoint:          String,
+    /// When to flush transcripts to the translation layer.
+    /// Default: `SpeechFinal` (accumulate, flush on utterance end).
+    pub flush_mode:        FlushMode,
 }
 
 impl DeepgramConfig {
@@ -59,11 +78,12 @@ impl DeepgramConfig {
             sample_rate:      16_000,
             channels:         1,
             interim_results:  true,
-            endpointing_ms:   200,
-            utterance_end_ms: 1000,
+            endpointing_ms:   300,
+            utterance_end_ms: 2000,
             smart_format:     true,
             punctuate:        true,
             endpoint:         "wss://api.deepgram.com/v1/listen".into(),
+            flush_mode:       FlushMode::SpeechFinal,
         }
     }
 
@@ -255,6 +275,9 @@ async fn run_client(
     log::info!("Deepgram: connected");
 
     let (mut ws_sink, mut ws_stream) = ws.split();
+    let mut stt_buf = String::new();
+    let flush_mode = cfg.flush_mode;
+    log::info!("Deepgram: flush_mode={:?}", flush_mode);
 
     loop {
         tokio::select! {
@@ -278,7 +301,7 @@ async fn run_client(
             maybe_msg = ws_stream.next() => {
                 match maybe_msg {
                     Some(Ok(msg)) => {
-                        if let Err(e) = handle_ws_message(msg, &event_tx, track).await {
+                        if let Err(e) = handle_ws_message(msg, &event_tx, track, &mut stt_buf, flush_mode).await {
                             log::warn!("Deepgram: bad ws message: {e}");
                         }
                     }
@@ -298,18 +321,32 @@ async fn run_client(
     // Drain tail finals after CloseStream.
     while let Some(msg) = ws_stream.next().await {
         match msg {
-            Ok(m) => { let _ = handle_ws_message(m, &event_tx, track).await; }
+            Ok(m) => { let _ = handle_ws_message(m, &event_tx, track, &mut stt_buf, flush_mode).await; }
             Err(_) => break,
         }
+    }
+
+    // Flush any remaining buffered text after the stream closes.
+    // Only relevant for SpeechFinal mode (IsFinal mode flushes immediately).
+    if !stt_buf.is_empty() {
+        let text = std::mem::take(&mut stt_buf);
+        log::info!("[{}] Stream ended — flushing remaining buffer ({}B): {:?}", ts(), text.len(), text);
+        let _ = event_tx.send(PipelineEvent::Flushed {
+            track,
+            text,
+            reason: "stream-end",
+        }).await;
     }
 
     Ok(())
 }
 
 async fn handle_ws_message(
-    msg:      Message,
-    event_tx: &mpsc::Sender<PipelineEvent>,
-    track:    TrackId,
+    msg:        Message,
+    event_tx:   &mpsc::Sender<PipelineEvent>,
+    track:      TrackId,
+    stt_buf:    &mut String,
+    flush_mode: FlushMode,
 ) -> Result<(), PipelineError> {
     let text = match msg {
         Message::Text(t) => t,
@@ -323,9 +360,22 @@ async fn handle_ws_message(
     match kind {
         "Results" => {
             let parsed: ResultsMsg = serde_json::from_value(raw)?;
-            handle_result(parsed, event_tx, track).await;
+            handle_result(parsed, event_tx, track, stt_buf, flush_mode).await;
         }
-        "UtteranceEnd" => log::info!("[{}] UtteranceEnd (no-op)", ts()),
+        "UtteranceEnd" => {
+            if flush_mode == FlushMode::IsFinal {
+                log::info!("[{}] UtteranceEnd (no-op in IsFinal mode)", ts());
+            } else if !stt_buf.is_empty() {
+                log::info!("[{}] UtteranceEnd — buffer len={}", ts(), stt_buf.len());
+                let text = std::mem::take(stt_buf);
+                log::info!("[{}] UtteranceEnd flush: {:?}", ts(), text);
+                let _ = event_tx.send(PipelineEvent::Flushed {
+                    track,
+                    text,
+                    reason: "utterance-end",
+                }).await;
+            }
+        }
         "SpeechStarted" => log::info!("[{}] SpeechStarted", ts()),
         "Metadata" | "Warning" => log::trace!("Deepgram: {kind}"),
         other => log::trace!("Deepgram: unknown message type '{other}'"),
@@ -334,9 +384,11 @@ async fn handle_ws_message(
 }
 
 async fn handle_result(
-    msg:      ResultsMsg,
-    event_tx: &mpsc::Sender<PipelineEvent>,
-    track:    TrackId,
+    msg:        ResultsMsg,
+    event_tx:   &mpsc::Sender<PipelineEvent>,
+    track:      TrackId,
+    stt_buf:    &mut String,
+    flush_mode: FlushMode,
 ) {
     let transcript = msg
         .channel
@@ -350,12 +402,54 @@ async fn handle_result(
             log::info!("[{}] is_final speech_final={} EMPTY (skipped)", ts(), msg.speech_final);
             return;
         }
-        log::info!("[{}] is_final speech_final={} → DeepL {:?}", ts(), msg.speech_final, transcript);
-        let _ = event_tx.send(PipelineEvent::Flushed {
-            track,
-            text:   transcript.trim().to_string(),
-            reason: "is-final",
-        }).await;
+
+        if flush_mode == FlushMode::IsFinal {
+            // IsFinal mode: flush immediately on every is_final. Lowest
+            // latency for subtitle overlays — user sees words as spoken.
+            log::info!(
+                "[{}] is_final (IsFinal mode) → flush: {:?}",
+                ts(),
+                transcript,
+            );
+            let _ = event_tx.send(PipelineEvent::Flushed {
+                track,
+                text: transcript.trim().to_string(),
+                reason: "is-final",
+            }).await;
+            return;
+        }
+
+        // SpeechFinal mode: accumulate intermediate finals, flush on speech_final.
+        if msg.speech_final {
+            let mut full = std::mem::take(stt_buf);
+            if !full.is_empty() {
+                full.push(' ');
+            }
+            full.push_str(transcript.trim());
+            log::info!(
+                "[{}] speech_final=true → flush (buf_was={}B, result={}B): {:?}",
+                ts(),
+                stt_buf.len(),
+                full.len(),
+                full,
+            );
+            let _ = event_tx.send(PipelineEvent::Flushed {
+                track,
+                text: full,
+                reason: "speech-final",
+            }).await;
+        } else {
+            if !stt_buf.is_empty() {
+                stt_buf.push(' ');
+            }
+            stt_buf.push_str(transcript.trim());
+            log::info!(
+                "[{}] is_final speech_final=false → buffer (len={}): {:?}",
+                ts(),
+                stt_buf.len(),
+                transcript,
+            );
+        }
     } else {
         if transcript.trim().is_empty() {
             return;
@@ -427,8 +521,8 @@ mod tests {
             "sample_rate=16000",
             "channels=1",
             "interim_results=true",
-            "endpointing=200",
-            "utterance_end_ms=1000",
+            "endpointing=300",
+            "utterance_end_ms=2000",
             "smart_format=true",
             "punctuate=true",
         ] {

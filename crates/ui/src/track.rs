@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use audio_os::{capture_indefinite, CaptureTarget, PlaybackFormat, PlaybackTarget};
 use pipeline::{
     DeepgramClient, DeepgramConfig, DeepLClient, DeepLConfig, ElevenLabsConfig,
-    PipelineEvent, ResampleState, TrackId, TranslationContext,
+    FlushMode, PipelineEvent, ResampleState, TrackId, TranslationContext,
 };
 use tokio::sync::mpsc;
 
@@ -198,9 +198,13 @@ async fn run_track(
     let log_track = cfg.source.log_track();
 
     // ── Deepgram ───────────────────────────────────────────────────────────
-    let dg_cfg = match cfg.source_lang.as_deref() {
+    let mut dg_cfg = match cfg.source_lang.as_deref() {
         Some(lang) => DeepgramConfig::with_language(cfg.dg_api_key.clone(), lang),
         None       => DeepgramConfig::with_detect_language(cfg.dg_api_key.clone()),
+    };
+    dg_cfg.flush_mode = match track_id {
+        TrackId::Outgoing => FlushMode::SpeechFinal, // mic → TTS: quality over latency
+        TrackId::Incoming => FlushMode::IsFinal,     // subtitles: latency over quality
     };
     let (dg_handle, mut dg_events) = DeepgramClient::spawn(dg_cfg, track_id);
     let dg_handle = Arc::new(dg_handle);
