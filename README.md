@@ -43,9 +43,12 @@ You need accounts and API keys for the services below. Free tiers are available 
 
 | Service | Used for | Required |
 |---------|----------|---------|
-| [Deepgram](https://console.deepgram.com/) | Speech-to-text (both tracks) | Yes |
-| [DeepL](https://www.deepl.com/pro-api) | Translation | Yes (without it, audio passes through untranslated) |
-| [ElevenLabs](https://elevenlabs.io) | Text-to-speech for your voice | Only for Track 1 TTS |
+| Deepgram | Speech-to-text (both tracks) | Yes (unless using Gemini for Track 1) |
+| DeepL | Translation | Yes (without it, source transcripts pass through untranslated) |
+| ElevenLabs | Text-to-speech for your voice | Only for Track 1 TTS fallback |
+| Google Gemini | Live speech-to-speech translation (Track 1) | Optional — replaces Deepgram+DeepL+ElevenLabs for mic |
+
+A single Google Gemini Live Translate key can drive the entire **Track 1** pipeline: it listens to your mic, translates in real time, and returns translated audio. When `GEMINI_API_KEY` is set, Track 1 uses Gemini instead of Deepgram + DeepL + ElevenLabs. Track 2 (incoming subtitles) still uses Deepgram + DeepL because Gemini only handles one direction at a time.
 
 ## Build
 
@@ -108,6 +111,8 @@ DEEPGRAM_API_KEY=your_deepgram_key_here
 DEEPL_API_KEY=your_deepl_key_here
 ELEVENLABS_API_KEY=your_elevenlabs_key_here
 VOICE_ID=your_elevenlabs_voice_id_here
+GEMINI_API_KEY=your_gemini_key_here
+# GEMINI_MODEL=gemini-3.5-live-translate-preview  # optional
 ```
 
 The app loads `.env` automatically on startup. You can also export these as shell environment variables, or enter the keys directly in the UI — keys typed in the UI take effect for that session only and are not persisted.
@@ -280,7 +285,10 @@ cargo run --bin pipeline-stt-stdin
 
 ```
 PipeWire mic ──► Deepgram STT (WS) ──► DeepL translate ──► ElevenLabs TTS (WS) ──► virtmic source
-                                                                                    [Track 1]
+                                                                                    [Track 1 fallback]
+
+PipeWire mic ──► Gemini Live Translate (WS) ──► translated audio ──► virtmic source
+                                                                                    [Track 1 with GEMINI_API_KEY]
 
 PipeWire sink monitor ──► Deepgram STT (WS) ──► DeepL translate ──► subtitle overlay
                                                                       [Track 2]

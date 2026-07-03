@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use audio_os::{capture_indefinite, CaptureTarget, PlaybackFormat, PlaybackTarget};
 use pipeline::{
     DeepgramClient, DeepgramConfig, DeepLClient, DeepLConfig, ElevenLabsConfig,
-    FlushMode, PipelineEvent, ResampleState, TrackId, TranslationContext,
+    FlushMode, GeminiClient, GeminiConfig, OUTPUT_SAMPLE_RATE, PipelineEvent,
+    ResampleState, TrackId, TranslationContext,
 };
 use tokio::sync::mpsc;
 
@@ -86,8 +87,14 @@ pub struct TrackConfig {
     // Translation (optional)
     pub deepl:       Option<DeeplTrackConfig>,
 
+    // Gemini Live Translate (outgoing only; replaces STT+translate+TTS)
+    pub gemini:      Option<GeminiTrackConfig>,
+
     // TTS + playback (outgoing only; None on incoming)
     pub tts:         Option<TtsConfig>,
+
+    // Playback sink name for outgoing audio (used by Gemini or TTS).
+    pub playback_sink_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +110,16 @@ pub struct TtsConfig {
     pub el_api_key:    String,
     pub voice_id:      String,
     pub sink_name:     Option<String>, // None = default sink
+}
+
+#[derive(Debug, Clone)]
+pub struct GeminiTrackConfig {
+    pub api_key:              String,
+    pub model:                String,
+    /// BCP-47 code sent to the Gemini API.
+    pub target_language_code: String,
+    /// DeepL-style code used for transcript logging (e.g. `"DE"`).
+    pub target_lang:          String,
 }
 
 /// Build `TrackConfig` values from AppConfig for both tracks.
@@ -139,13 +156,26 @@ pub fn track_configs_from_app(
         None
     };
 
+    let gemini_cfg = if cfg.has_gemini() {
+        Some(GeminiTrackConfig {
+            api_key: cfg.gemini_api_key.clone(),
+            model: cfg.gemini_model.clone(),
+            target_language_code: pipeline::bcp47_from_deepl(t1_target_lang),
+            target_lang: t1_target_lang.to_owned(),
+        })
+    } else {
+        None
+    };
+
     let t1 = TrackConfig {
         track_id:    TrackId::Outgoing,
         source:      TrackSource::Mic(mic_node),
         dg_api_key:  cfg.dg_api_key.clone(),
         source_lang: cfg.source_lang.clone(),
         deepl:       make_deepl(t1_target_lang),
+        gemini:      gemini_cfg,
         tts:         tts_cfg,
+        playback_sink_name: cfg.tts_sink_name.clone(),
     };
 
     let t2 = if cfg.track2_enabled && cfg.has_deepl() {
@@ -155,7 +185,9 @@ pub fn track_configs_from_app(
             dg_api_key:  cfg.dg_api_key.clone(),
             source_lang: cfg.source_lang.clone(),
             deepl:       make_deepl(t2_target_lang),
+            gemini:      None,
             tts:         None,
+            playback_sink_name: None,
         })
     } else {
         None
@@ -177,9 +209,14 @@ pub fn spawn_track(
     let (event_tx, event_rx) = mpsc::channel::<TrackEvent>(256);
 
     rt.spawn(async move {
-        if let Err(e) = run_track(cfg, stop, log, event_tx.clone()).await {
+        let result = if cfg.gemini.is_some() {
+            run_track_gemini(cfg, stop, log, event_tx.clone()).await
+        } else {
+            run_track(cfg, stop, log, event_tx.clone()).await
+        };
+        if let Err(e) = result {
             let _ = event_tx.send(TrackEvent::Error {
-                track:   TrackId::Outgoing, // overridden inside run_track on error
+                track:   TrackId::Outgoing, // overridden inside runners on error
                 message: format!("{e}"),
             }).await;
         }
@@ -475,6 +512,151 @@ async fn handle_pipeline_event(
                 message: error,
             }).await;
         }
+    }
+}
+
+// ── Gemini Track 1 runner ──────────────────────────────────────────────────
+
+async fn run_track_gemini(
+    cfg:      TrackConfig,
+    stop:     Arc<AtomicBool>,
+    log:      TranscriptLog,
+    event_tx: mpsc::Sender<TrackEvent>,
+) -> anyhow::Result<()> {
+    let track_id = cfg.track_id;
+    debug_assert_eq!(track_id, TrackId::Outgoing);
+    let log_track = cfg.source.log_track();
+
+    let gemini_cfg = cfg.gemini.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("run_track_gemini called without Gemini config"))?;
+
+    // ── Gemini client ─────────────────────────────────────────────────────
+    let mut g_cfg = GeminiConfig::new(
+        gemini_cfg.api_key.clone(),
+        gemini_cfg.target_language_code.clone(),
+    );
+    g_cfg.model = gemini_cfg.model.clone();
+    let (g_handle, mut g_events, mut pcm_rx) = GeminiClient::spawn(g_cfg, track_id);
+    let g_handle = Arc::new(g_handle);
+
+    // ── Playback (translated audio at 24 kHz) ───────────────────────────────
+    let pb_target = match cfg.playback_sink_name.as_deref() {
+        Some(name) => PlaybackTarget::NodeName(name.to_owned()),
+        None       => PlaybackTarget::Default,
+    };
+    let pb_format = PlaybackFormat { sample_rate: OUTPUT_SAMPLE_RATE, channels: 1 };
+    const RING_CAP: usize = 24_000 * 30;
+
+    let (mut pw_handle, pw_join) = audio_os::spawn_streaming_player(pb_target, pb_format, RING_CAP);
+
+    tokio::spawn(async move {
+        while let Some(msg) = pcm_rx.recv().await {
+            if let Some(samples) = msg {
+                pw_handle.push_pcm(&samples);
+            }
+        }
+        pw_handle.finish();
+        let _ = tokio::task::spawn_blocking(move || pw_join.join()).await;
+    });
+
+    // ── Capture thread ─────────────────────────────────────────────────────
+    let capture_target = resolve_capture_target(&cfg.source);
+    let g_h = g_handle.clone();
+    let stop_cap = stop.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let mut state: Option<(ResampleState, u32, u16)> = None;
+        if let Err(e) = capture_indefinite(
+            capture_target,
+            stop_cap,
+            move |samples, fmt| {
+                let needs_reinit = state.as_ref()
+                    .map(|(_, r, c)| *r != fmt.sample_rate || *c != fmt.channels)
+                    .unwrap_or(true);
+                if needs_reinit {
+                    match ResampleState::new(fmt.sample_rate, fmt.channels) {
+                        Ok(rs) => {
+                            log::info!("capture: resampler (re)init rate={} ch={}", fmt.sample_rate, fmt.channels);
+                            state = Some((rs, fmt.sample_rate, fmt.channels));
+                        }
+                        Err(e) => {
+                            log::error!("capture: resampler init failed: {e}");
+                            return;
+                        }
+                    }
+                }
+                let (rs, _, _) = state.as_mut().unwrap();
+                if let Ok(pcm16) = rs.push(samples) {
+                    if !pcm16.is_empty() {
+                        g_h.push_pcm(pcm16);
+                    }
+                }
+            },
+        ) {
+            log::error!("capture_indefinite: {e}");
+        }
+        log::info!("capture thread for Gemini track ended");
+    });
+
+    // ── Event loop ─────────────────────────────────────────────────────────
+    let target_lang = gemini_cfg.target_lang.clone();
+
+    loop {
+        if stop.load(Ordering::Acquire) {
+            log::info!("Track {:?}: stop flag set, closing Gemini WS", track_id);
+            break;
+        }
+
+        match tokio::time::timeout(Duration::from_millis(100), g_events.recv()).await {
+            Err(_) => continue,
+            Ok(None) => break,
+            Ok(Some(evt)) => {
+                handle_gemini_event(evt, track_id, log_track, &log, &event_tx, &target_lang).await;
+            }
+        }
+    }
+
+    drop(g_handle);
+    let _ = event_tx.send(TrackEvent::Ended { track: track_id }).await;
+    log::info!("Track {:?}: Gemini runner exited", track_id);
+    Ok(())
+}
+
+async fn handle_gemini_event(
+    evt:          PipelineEvent,
+    track_id:     TrackId,
+    log_track:    LogTrack,
+    log:          &TranscriptLog,
+    event_tx:     &mpsc::Sender<TrackEvent>,
+    target_lang:  &str,
+) {
+    match evt {
+        PipelineEvent::Partial { text, .. } => {
+            log.log_partial(log_track, &text);
+            let _ = event_tx.send(TrackEvent::Partial { track: track_id, text }).await;
+        }
+
+        PipelineEvent::Translated { source_text, translated, .. } => {
+            if !source_text.is_empty() && source_text != "..." {
+                log.log_source(log_track, &source_text);
+            }
+            log.log_translated(log_track, target_lang, &translated);
+            let _ = event_tx.send(TrackEvent::Translated {
+                track: track_id,
+                source: source_text,
+                translated,
+            }).await;
+        }
+
+        PipelineEvent::Error { error, .. } => {
+            log::error!("Gemini error on track {:?}: {error}", track_id);
+            let _ = event_tx.send(TrackEvent::Error {
+                track: track_id,
+                message: error,
+            }).await;
+        }
+
+        _ => {}
     }
 }
 

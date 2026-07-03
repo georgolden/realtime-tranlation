@@ -19,10 +19,12 @@ use serde::Deserialize;
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     // ── API keys (secrets — from env only, never stored in config.toml) ──
-    pub dg_api_key:   String,
-    pub deepl_key:    String,
-    pub el_key:       String,
-    pub voice_id:     String,
+    pub dg_api_key:    String,
+    pub deepl_key:     String,
+    pub el_key:        String,
+    pub voice_id:      String,
+    pub gemini_api_key: String,
+    pub gemini_model:  String,
 
     // ── Language ──────────────────────────────────────────────────────────
     /// Deepgram STT source language. `None` = auto-detect (`language=multi`).
@@ -54,6 +56,8 @@ impl Default for AppConfig {
             deepl_key:         String::new(),
             el_key:            String::new(),
             voice_id:          String::new(),
+            gemini_api_key:    String::new(),
+            gemini_model:      "gemini-3.5-live-translate-preview".to_owned(),
             source_lang:       None,
             t1_target_lang:    "DE".to_owned(),
             t2_target_lang:    "EN".to_owned(),
@@ -90,6 +94,8 @@ impl AppConfig {
         if let Ok(v) = std::env::var("DEEPL_API_KEY")    { cfg.deepl_key  = v; }
         if let Ok(v) = std::env::var("ELEVENLABS_API_KEY") { cfg.el_key   = v; }
         if let Ok(v) = std::env::var("VOICE_ID")          { cfg.voice_id  = v; }
+        if let Ok(v) = std::env::var("GEMINI_API_KEY")    { cfg.gemini_api_key = v; }
+        if let Ok(v) = std::env::var("GEMINI_MODEL")      { cfg.gemini_model   = v; }
 
         cfg
     }
@@ -120,6 +126,7 @@ impl AppConfig {
 
     pub fn has_deepl(&self) -> bool  { !self.deepl_key.is_empty() }
     pub fn has_tts(&self)   -> bool  { !self.el_key.is_empty() && !self.voice_id.is_empty() }
+    pub fn has_gemini(&self) -> bool { !self.gemini_api_key.is_empty() }
 }
 
 // ── TOML deserialization schema ────────────────────────────────────────────
