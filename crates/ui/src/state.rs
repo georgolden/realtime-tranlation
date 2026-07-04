@@ -94,6 +94,7 @@ pub struct UiState {
     pub deepl_key: String,
     pub el_key:    String,
     pub voice_id:  String,
+    pub gemini_key: String,
 
     // ── Overlay ───────────────────────────────────────────────────────────
     /// Number of subtitle lines shown in the overlay window (default 3).
@@ -155,6 +156,7 @@ impl UiState {
             deepl_key:          cfg.deepl_key.clone(),
             el_key:             cfg.el_key.clone(),
             voice_id:           cfg.voice_id.clone(),
+            gemini_key:         cfg.gemini_api_key.clone(),
             status:             SessionStatus::Idle,
             log_path:           None,
             mic_lines:          Vec::new(),

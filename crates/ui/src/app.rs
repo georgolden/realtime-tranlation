@@ -52,8 +52,13 @@ impl TranslatorApp {
     // ── Session lifecycle ──────────────────────────────────────────────────
 
     fn start(&mut self) {
-        if self.state.dg_key.is_empty() {
-            self.state.errors.insert(0, "DEEPGRAM_API_KEY is required.".into());
+        let needs_dg = self.state.track2_enabled || self.state.gemini_key.is_empty();
+        if needs_dg && self.state.dg_key.is_empty() {
+            self.state.errors.insert(0, "DEEPGRAM_API_KEY is required (Track 2 or no Gemini key).".into());
+            return;
+        }
+        if self.state.gemini_key.is_empty() && self.state.deepl_key.is_empty() {
+            self.state.errors.insert(0, "Provide either GEMINI_API_KEY or DEEPL_API_KEY.".into());
             return;
         }
 
@@ -63,6 +68,7 @@ impl TranslatorApp {
         cfg.deepl_key       = self.state.deepl_key.clone();
         cfg.el_key          = self.state.el_key.clone();
         cfg.voice_id        = self.state.voice_id.clone();
+        cfg.gemini_api_key  = self.state.gemini_key.clone();
         cfg.t1_target_lang  = self.state.t1_target_lang().to_owned();
         cfg.t2_target_lang  = self.state.t2_target_lang().to_owned();
         cfg.track2_enabled  = self.state.track2_enabled;
@@ -303,7 +309,14 @@ fn draw_api_keys(ui: &mut egui::Ui, state: &mut UiState) {
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Deepgram (required):");
+                ui.label("Gemini (mic → translated audio):");
+                ui.add_enabled(
+                    !running,
+                    egui::TextEdit::singleline(&mut state.gemini_key).password(true),
+                );
+                ui.end_row();
+
+                ui.label("Deepgram (Track 2 / fallback):");
                 ui.add_enabled(
                     !running,
                     egui::TextEdit::singleline(&mut state.dg_key).password(true),
@@ -317,7 +330,7 @@ fn draw_api_keys(ui: &mut egui::Ui, state: &mut UiState) {
                 );
                 ui.end_row();
 
-                ui.label("ElevenLabs (TTS):");
+                ui.label("ElevenLabs (TTS fallback):");
                 ui.add_enabled(
                     !running,
                     egui::TextEdit::singleline(&mut state.el_key).password(true),
