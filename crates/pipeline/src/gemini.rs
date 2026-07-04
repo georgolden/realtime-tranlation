@@ -280,6 +280,11 @@ struct ServerContent {
 
 #[derive(Deserialize, Debug, Clone)]
 struct Transcription {
+    // Gemini sometimes sends transcription updates (e.g. turn-finished
+    // markers) with no `text` key at all — default instead of failing
+    // the whole message's deserialization, which would also drop any
+    // audio/other content riding in the same serverContent.
+    #[serde(default)]
     text: String,
     #[serde(rename = "languageCode")]
     _language_code: Option<String>,
@@ -311,6 +316,22 @@ struct GeminiError {
 
 // ── Runner ───────────────────────────────────────────────────────────────────
 
+/// Why a session ended, decided by the caller whether to reconnect.
+enum SessionEnd {
+    /// The audio input channel closed — the caller is shutting down, no
+    /// more work will ever arrive. Stop for good.
+    InputClosed,
+    /// The connection ended for any other reason (server closed it,
+    /// stream EOF, fatal-looking server error). More audio may still be
+    /// queued, so the caller should reconnect.
+    Reconnect,
+}
+
+/// Reconnect loop around a single WebSocket session. A dropped connection,
+/// a `setupComplete` timeout, or any other transient failure no longer
+/// tears down the whole track (which previously required the user to
+/// restart the session manually) — it retries with capped exponential
+/// backoff for as long as the caller keeps feeding audio in.
 async fn run_client(
     cfg: GeminiConfig,
     track: TrackId,
@@ -318,6 +339,56 @@ async fn run_client(
     event_tx: mpsc::Sender<PipelineEvent>,
     pcm_tx: mpsc::Sender<Option<Vec<f32>>>,
 ) -> Result<(), PipelineError> {
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    // A session that stayed up at least this long counts as "was healthy",
+    // so a later drop resets backoff instead of compounding it.
+    const HEALTHY_THRESHOLD: Duration = Duration::from_secs(10);
+
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        let attempt_start = tokio::time::Instant::now();
+        let outcome = run_session(&cfg, track, &mut audio_rx, &event_tx, &pcm_tx).await;
+
+        match &outcome {
+            Ok(SessionEnd::InputClosed) => return Ok(()),
+            Ok(SessionEnd::Reconnect) => {
+                log::warn!("Gemini: session ended, will reconnect");
+            }
+            Err(e) => {
+                log::warn!("Gemini: session error ({e}), will reconnect");
+                let _ = event_tx
+                    .send(PipelineEvent::Error {
+                        track,
+                        error: format!("Gemini connection lost, reconnecting: {e}"),
+                    })
+                    .await;
+            }
+        }
+
+        // Caller (audio producer) is gone and nothing more is queued —
+        // nothing left to reconnect for.
+        if audio_rx.is_closed() && audio_rx.is_empty() {
+            return Ok(());
+        }
+
+        if attempt_start.elapsed() >= HEALTHY_THRESHOLD {
+            backoff = INITIAL_BACKOFF;
+        }
+
+        log::info!("Gemini: reconnecting in {:?}", backoff);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+async fn run_session(
+    cfg: &GeminiConfig,
+    track: TrackId,
+    audio_rx: &mut mpsc::Receiver<Vec<i16>>,
+    event_tx: &mpsc::Sender<PipelineEvent>,
+    pcm_tx: &mpsc::Sender<Option<Vec<f32>>>,
+) -> Result<SessionEnd, PipelineError> {
     let url = cfg.ws_url();
     log::info!(
         "Gemini: connecting to Live Translate (model={} key={}...)",
@@ -456,7 +527,7 @@ async fn run_client(
                             input_buffer.clear();
                         }
                         log::info!("Gemini: audio input closed, ending session");
-                        break;
+                        return Ok(SessionEnd::InputClosed);
                     }
                 }
             }
@@ -485,8 +556,8 @@ async fn run_client(
                         }
                         match handle_message(
                             msg,
-                            &event_tx,
-                            &pcm_tx,
+                            event_tx,
+                            pcm_tx,
                             track,
                             &cfg.target_language_code,
                             &mut last_input_text,
@@ -515,7 +586,7 @@ async fn run_client(
         }
     }
 
-    Ok(())
+    Ok(SessionEnd::Reconnect)
 }
 
 async fn send_audio_chunk(
@@ -705,5 +776,17 @@ mod tests {
         assert_eq!(bcp47_from_deepl("PT-PT"), "pt-PT");
         assert_eq!(bcp47_from_deepl("ZH"), "zh-Hans");
         assert_eq!(bcp47_from_deepl("et"), "et");
+    }
+
+    #[test]
+    fn transcription_without_text_field_parses() {
+        // Gemini sends turn-finished markers on inputTranscription /
+        // outputTranscription with no `text` key at all. The whole
+        // message must still parse so any audio riding alongside it
+        // isn't dropped.
+        let json = r#"{"serverContent":{"outputTranscription":{"languageCode":"de"}}}"#;
+        let resp: GeminiResponse = serde_json::from_str(json).unwrap();
+        let content = resp.server_content.unwrap();
+        assert_eq!(content.output_transcription.unwrap().text, "");
     }
 }
