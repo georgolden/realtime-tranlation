@@ -16,7 +16,7 @@
 //! straight into the PipeWire playback path.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -108,6 +108,7 @@ impl GeminiConfig {
 pub struct GeminiHandle {
     audio_tx: mpsc::Sender<Vec<i16>>,
     closed_logged: Arc<AtomicBool>,
+    push_count: Arc<AtomicUsize>,
 }
 
 impl GeminiHandle {
@@ -116,6 +117,10 @@ impl GeminiHandle {
     pub fn push_pcm(&self, samples: Vec<i16>) {
         if samples.is_empty() {
             return;
+        }
+        let n = self.push_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 3 || n % 100 == 0 {
+            log::info!("Gemini push_pcm #{n}: {} samples", samples.len());
         }
         match self.audio_tx.try_send(samples) {
             Ok(()) => {}
@@ -193,6 +198,7 @@ impl GeminiClient {
             GeminiHandle {
                 audio_tx,
                 closed_logged: Arc::new(AtomicBool::new(false)),
+                push_count: Arc::new(AtomicUsize::new(0)),
             },
             event_rx,
             pcm_rx,
@@ -212,16 +218,16 @@ struct Setup {
     model: String,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
+    #[serde(rename = "inputAudioTranscription")]
+    input_audio_transcription: Empty,
+    #[serde(rename = "outputAudioTranscription")]
+    output_audio_transcription: Empty,
 }
 
 #[derive(Serialize, Debug)]
 struct GenerationConfig {
     #[serde(rename = "responseModalities")]
     response_modalities: Vec<String>,
-    #[serde(rename = "inputAudioTranscription")]
-    input_audio_transcription: Empty,
-    #[serde(rename = "outputAudioTranscription")]
-    output_audio_transcription: Empty,
     #[serde(rename = "translationConfig")]
     translation_config: TranslationConfig,
 }
@@ -319,7 +325,11 @@ async fn run_client(
     pcm_tx: mpsc::Sender<Option<Vec<f32>>>,
 ) -> Result<(), PipelineError> {
     let url = cfg.ws_url();
-    log::info!("Gemini: connecting to Live Translate (model={})", cfg.model);
+    log::info!(
+        "Gemini: connecting to Live Translate (model={} key={}...)",
+        cfg.model,
+        cfg.api_key.chars().take(4).collect::<String>()
+    );
 
     let req = url
         .as_str()
@@ -334,19 +344,21 @@ async fn run_client(
             model: format!("models/{}", cfg.model),
             generation_config: GenerationConfig {
                 response_modalities: vec!["AUDIO".into()],
-                input_audio_transcription: Empty {},
-                output_audio_transcription: Empty {},
                 translation_config: TranslationConfig {
                     target_language_code: cfg.target_language_code.clone(),
                     echo_target_language: cfg.echo_target_language,
                 },
             },
+            input_audio_transcription: Empty {},
+            output_audio_transcription: Empty {},
         },
     };
+    let setup_json = serde_json::to_string(&setup)?;
+    log::info!("Gemini setup message: {}", setup_json);
 
     let (mut ws_sink, mut ws_stream) = ws.split();
     ws_sink
-        .send(Message::Text(serde_json::to_string(&setup)?.into()))
+        .send(Message::Text(setup_json.into()))
         .await
         .map_err(PipelineError::WebSocket)?;
 
@@ -356,6 +368,7 @@ async fn run_client(
     flush_tick.tick().await; // consume immediate first tick
 
     let mut last_input_text: String = String::new();
+    let mut setup_seen = false;
 
     loop {
         tokio::select! {
@@ -390,15 +403,40 @@ async fn run_client(
             maybe_msg = ws_stream.next() => {
                 match maybe_msg {
                     Some(Ok(msg)) => {
-                        if let Err(e) = handle_message(
+                        if msg.is_close() {
+                            if let Message::Close(Some(frame)) = msg {
+                                log::info!(
+                                    "Gemini: server closed the WebSocket (code={} reason={})",
+                                    frame.code,
+                                    frame.reason
+                                );
+                            } else {
+                                log::info!("Gemini: server closed the WebSocket (no reason)");
+                            }
+                            break;
+                        }
+                        if msg.is_text() {
+                            if let Ok(text) = msg.to_text() {
+                                log::info!("Gemini raw response: {}", text);
+                            }
+                        }
+                        match handle_message(
                             msg,
                             &event_tx,
                             &pcm_tx,
                             track,
                             &cfg.target_language_code,
                             &mut last_input_text,
+                            &mut setup_seen,
                         ).await {
-                            log::warn!("Gemini: bad message: {e}");
+                            Ok(true) => {}
+                            Ok(false) => {
+                                log::info!("Gemini: ending session after server error");
+                                break;
+                            }
+                            Err(e) => {
+                                log::warn!("Gemini: bad message: {e}");
+                            }
                         }
                     }
                     Some(Err(e)) => {
@@ -406,7 +444,7 @@ async fn run_client(
                         return Err(PipelineError::WebSocket(e));
                     }
                     None => {
-                        log::info!("Gemini: ws closed");
+                        log::info!("Gemini: ws stream ended");
                         break;
                     }
                 }
@@ -428,6 +466,7 @@ async fn send_audio_chunk(
 ) -> Result<(), PipelineError> {
     let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    log::info!("Gemini send_audio_chunk: {} bytes -> {} b64 chars", bytes.len(), b64.len());
     let msg = RealtimeInputMessage {
         realtime_input: RealtimeInput {
             audio: AudioBlob {
@@ -443,6 +482,7 @@ async fn send_audio_chunk(
         .map_err(PipelineError::WebSocket)
 }
 
+/// Returns Ok(true) to keep the session alive, Ok(false) to shut down cleanly.
 async fn handle_message(
     msg: Message,
     event_tx: &mpsc::Sender<PipelineEvent>,
@@ -450,11 +490,12 @@ async fn handle_message(
     track: TrackId,
     _target_lang: &str,
     last_input_text: &mut String,
-) -> Result<(), PipelineError> {
+    setup_seen: &mut bool,
+) -> Result<bool, PipelineError> {
     let text = match msg {
         Message::Text(t) => t,
-        Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(()),
-        Message::Close(_) => return Ok(()),
+        Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(true),
+        Message::Close(_) => return Ok(false),
     };
 
     let resp: GeminiResponse = serde_json::from_str(&text)?;
@@ -467,14 +508,20 @@ async fn handle_message(
                 error: format!("Gemini API error: {} (code {:?})", err.message, err.code),
             })
             .await;
-        return Ok(());
+        return Ok(false);
     }
 
-    let Some(content) = resp.server_content else { return Ok(()) };
+    if resp._setup_complete.is_some() {
+        *setup_seen = true;
+        log::info!("Gemini: setup complete");
+    }
+
+    let Some(content) = resp.server_content else { return Ok(true) };
 
     if let Some(tx) = content.input_transcription {
         let t = tx.text.trim();
         if !t.is_empty() {
+            log::info!("Gemini input transcription: {}", t);
             *last_input_text = t.to_string();
             let _ = event_tx
                 .send(PipelineEvent::Partial {
@@ -488,6 +535,7 @@ async fn handle_message(
     if let Some(tx) = content.output_transcription {
         let t = tx.text.trim();
         if !t.is_empty() {
+            log::info!("Gemini output transcription: {}", t);
             let source = if last_input_text.is_empty() {
                 "...".to_string()
             } else {
@@ -504,18 +552,24 @@ async fn handle_message(
     }
 
     if let Some(turn) = content.model_turn {
+        let mut audio_parts = 0;
         for part in turn.parts {
             if let Some(data) = part.inline_data {
                 if data.mime_type.starts_with("audio/") {
+                    audio_parts += 1;
                     if let Some(samples) = decode_pcm(&data.data) {
+                        log::info!("Gemini audio chunk: {} samples", samples.len());
                         let _ = pcm_tx.send(Some(samples)).await;
                     }
                 }
             }
         }
+        if audio_parts > 0 {
+            log::info!("Gemini model_turn: {} audio part(s)", audio_parts);
+        }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn decode_pcm(b64: &str) -> Option<Vec<f32>> {

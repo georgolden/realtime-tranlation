@@ -550,8 +550,13 @@ async fn run_track_gemini(
     let (mut pw_handle, pw_join) = audio_os::spawn_streaming_player(pb_target, pb_format, RING_CAP);
 
     tokio::spawn(async move {
+        let mut chunk_count = 0usize;
         while let Some(msg) = pcm_rx.recv().await {
             if let Some(samples) = msg {
+                chunk_count += 1;
+                if chunk_count <= 3 || chunk_count % 100 == 0 {
+                    log::info!("Gemini playback chunk #{chunk_count}: {} samples", samples.len());
+                }
                 pw_handle.push_pcm(&samples);
             }
         }

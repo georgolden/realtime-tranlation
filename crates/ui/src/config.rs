@@ -94,8 +94,8 @@ impl AppConfig {
         if let Ok(v) = std::env::var("DEEPL_API_KEY")    { cfg.deepl_key  = v; }
         if let Ok(v) = std::env::var("ELEVENLABS_API_KEY") { cfg.el_key   = v; }
         if let Ok(v) = std::env::var("VOICE_ID")          { cfg.voice_id  = v; }
-        if let Ok(v) = std::env::var("GEMINI_API_KEY")    { cfg.gemini_api_key = v; }
-        if let Ok(v) = std::env::var("GEMINI_MODEL")      { cfg.gemini_model   = v; }
+        if let Ok(v) = std::env::var("GEMINI_API_KEY")    { cfg.gemini_api_key = v.trim().to_owned(); }
+        if let Ok(v) = std::env::var("GEMINI_MODEL")      { cfg.gemini_model   = v.trim().to_owned(); }
 
         cfg
     }
