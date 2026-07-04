@@ -16,7 +16,7 @@
 //! straight into the PipeWire playback path.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -108,7 +108,6 @@ impl GeminiConfig {
 pub struct GeminiHandle {
     audio_tx: mpsc::Sender<Vec<i16>>,
     closed_logged: Arc<AtomicBool>,
-    push_count: Arc<AtomicUsize>,
 }
 
 impl GeminiHandle {
@@ -117,10 +116,6 @@ impl GeminiHandle {
     pub fn push_pcm(&self, samples: Vec<i16>) {
         if samples.is_empty() {
             return;
-        }
-        let n = self.push_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 3 || n % 100 == 0 {
-            log::info!("Gemini push_pcm #{n}: {} samples", samples.len());
         }
         match self.audio_tx.try_send(samples) {
             Ok(()) => {}
@@ -198,7 +193,6 @@ impl GeminiClient {
             GeminiHandle {
                 audio_tx,
                 closed_logged: Arc::new(AtomicBool::new(false)),
-                push_count: Arc::new(AtomicUsize::new(0)),
             },
             event_rx,
             pcm_rx,
@@ -354,31 +348,105 @@ async fn run_client(
         },
     };
     let setup_json = serde_json::to_string(&setup)?;
-    log::info!("Gemini setup message: {}", setup_json);
+    log::debug!("Gemini setup message: {}", setup_json);
 
     let (mut ws_sink, mut ws_stream) = ws.split();
     ws_sink
         .send(Message::Text(setup_json.into()))
         .await
         .map_err(PipelineError::WebSocket)?;
+    log::info!("Gemini: setup sent, waiting for setupComplete");
 
-    // Buffer input audio so we send ~100 ms chunks as recommended.
+    // Wait for setupComplete before streaming audio, mirroring the Python SDK.
+    let mut setup_seen = false;
+    let setup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !setup_seen {
+        match tokio::time::timeout_at(setup_deadline, ws_stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if msg.is_close() {
+                    log::error!("Gemini: server closed WebSocket before setupComplete");
+                    return Err(PipelineError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "server closed WebSocket before setupComplete",
+                    )));
+                }
+                let text = match msg {
+                    Message::Text(t) => t.to_string(),
+                    // Gemini sends JSON payloads over Binary-opcode frames, not Text.
+                    Message::Binary(b) => match String::from_utf8(b.to_vec()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("Gemini: non-UTF8 binary frame during setup: {e}");
+                            continue;
+                        }
+                    },
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+                        continue;
+                    }
+                    Message::Close(_) => {
+                        log::error!("Gemini: server closed WebSocket before setupComplete");
+                        return Err(PipelineError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "server closed WebSocket before setupComplete",
+                        )));
+                    }
+                };
+                log::debug!("Gemini setup response raw: {}", text);
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => {
+                        if v.get("setupComplete").is_some() {
+                            setup_seen = true;
+                            log::info!("Gemini: setup complete");
+                        }
+                        if let Some(err) = v.get("error") {
+                            log::error!("Gemini setup error: {}", err);
+                            return Err(PipelineError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Gemini setup error: {}", err).as_str(),
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Gemini: bad setup response JSON: {e}");
+                    }
+                }
+            }
+            Ok(Some(Err(e))) => {
+                log::error!("Gemini: ws error during setup: {e}");
+                return Err(PipelineError::WebSocket(e));
+            }
+            Ok(None) => {
+                log::error!("Gemini: ws stream ended before setupComplete");
+                return Err(PipelineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Gemini: ws stream ended before setupComplete",
+                )));
+            }
+            Err(_) => {
+                log::error!("Gemini: timeout waiting for setupComplete");
+                return Err(PipelineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Gemini: timeout waiting for setupComplete",
+                )));
+            }
+        }
+    }
+
+    // Buffer input audio so we send exactly 100 ms chunks (1600 samples) as recommended.
     let mut input_buffer: Vec<i16> = Vec::with_capacity(INPUT_CHUNK_SAMPLES * 2);
     let mut flush_tick = interval(Duration::from_millis(100));
     flush_tick.tick().await; // consume immediate first tick
 
     let mut last_input_text: String = String::new();
-    let mut setup_seen = false;
-
     loop {
         tokio::select! {
             maybe_samples = audio_rx.recv() => {
                 match maybe_samples {
                     Some(samples) => {
                         input_buffer.extend_from_slice(&samples);
-                        if input_buffer.len() >= INPUT_CHUNK_SAMPLES {
-                            send_audio_chunk(&mut ws_sink, &input_buffer).await?;
-                            input_buffer.clear();
+                        while input_buffer.len() >= INPUT_CHUNK_SAMPLES {
+                            let chunk: Vec<i16> = input_buffer.drain(..INPUT_CHUNK_SAMPLES).collect();
+                            send_audio_chunk(&mut ws_sink, &chunk).await?;
                         }
                     }
                     None => {
@@ -414,11 +482,6 @@ async fn run_client(
                                 log::info!("Gemini: server closed the WebSocket (no reason)");
                             }
                             break;
-                        }
-                        if msg.is_text() {
-                            if let Ok(text) = msg.to_text() {
-                                log::info!("Gemini raw response: {}", text);
-                            }
                         }
                         match handle_message(
                             msg,
@@ -466,7 +529,6 @@ async fn send_audio_chunk(
 ) -> Result<(), PipelineError> {
     let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    log::info!("Gemini send_audio_chunk: {} bytes -> {} b64 chars", bytes.len(), b64.len());
     let msg = RealtimeInputMessage {
         realtime_input: RealtimeInput {
             audio: AudioBlob {
@@ -493,8 +555,16 @@ async fn handle_message(
     setup_seen: &mut bool,
 ) -> Result<bool, PipelineError> {
     let text = match msg {
-        Message::Text(t) => t,
-        Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(true),
+        Message::Text(t) => t.to_string(),
+        // Gemini sends JSON payloads over Binary-opcode frames, not Text.
+        Message::Binary(b) => match String::from_utf8(b.to_vec()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Gemini: non-UTF8 binary frame: {e}");
+                return Ok(true);
+            }
+        },
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(true),
         Message::Close(_) => return Ok(false),
     };
 
@@ -552,20 +622,14 @@ async fn handle_message(
     }
 
     if let Some(turn) = content.model_turn {
-        let mut audio_parts = 0;
         for part in turn.parts {
             if let Some(data) = part.inline_data {
                 if data.mime_type.starts_with("audio/") {
-                    audio_parts += 1;
                     if let Some(samples) = decode_pcm(&data.data) {
-                        log::info!("Gemini audio chunk: {} samples", samples.len());
                         let _ = pcm_tx.send(Some(samples)).await;
                     }
                 }
             }
-        }
-        if audio_parts > 0 {
-            log::info!("Gemini model_turn: {} audio part(s)", audio_parts);
         }
     }
 
@@ -618,13 +682,13 @@ mod tests {
                 model: format!("models/{}", cfg.model),
                 generation_config: GenerationConfig {
                     response_modalities: vec!["AUDIO".into()],
-                    input_audio_transcription: Empty {},
-                    output_audio_transcription: Empty {},
                     translation_config: TranslationConfig {
                         target_language_code: cfg.target_language_code,
                         echo_target_language: cfg.echo_target_language,
                     },
                 },
+                input_audio_transcription: Empty {},
+                output_audio_transcription: Empty {},
             },
         };
         let json = serde_json::to_string(&setup).unwrap();
