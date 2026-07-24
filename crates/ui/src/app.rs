@@ -18,7 +18,7 @@ use pipeline::TranscriptBufferConfig;
 
 use crate::config::AppConfig;
 use crate::session::{start_session, SessionHandle};
-use crate::state::{SessionStatus, SubtitleLine, UiState, DEEPL_TARGET_LANGS, SUPPORTED_LANGS};
+use crate::state::{SessionStatus, SubtitleLine, UiState, DEEPL_TARGET_LANGS, STT_PROVIDERS, SUPPORTED_LANGS};
 
 // ── App ────────────────────────────────────────────────────────────────────
 
@@ -52,8 +52,13 @@ impl TranslatorApp {
     // ── Session lifecycle ──────────────────────────────────────────────────
 
     fn start(&mut self) {
-        let needs_dg = self.state.track2_enabled || self.state.gemini_key.is_empty();
-        if needs_dg && self.state.dg_key.is_empty() {
+        let needs_stt = self.state.track2_enabled || self.state.gemini_key.is_empty();
+        let use_scribe = self.state.stt_provider() == "scribe";
+        if needs_stt && use_scribe && self.state.el_key.is_empty() {
+            self.state.errors.insert(0, "ELEVENLABS_API_KEY is required for Scribe STT (Track 2 or no Gemini key).".into());
+            return;
+        }
+        if needs_stt && !use_scribe && self.state.dg_key.is_empty() {
             self.state.errors.insert(0, "DEEPGRAM_API_KEY is required (Track 2 or no Gemini key).".into());
             return;
         }
@@ -79,6 +84,7 @@ impl TranslatorApp {
         cfg.el_key          = self.state.el_key.clone();
         cfg.voice_id        = self.state.voice_id.clone();
         cfg.gemini_api_key  = self.state.gemini_key.clone();
+        cfg.stt_provider    = self.state.stt_provider().to_owned();
         cfg.t1_target_lang  = self.state.t1_target_lang().to_owned();
         cfg.t2_target_lang  = self.state.t2_target_lang().to_owned();
         cfg.track2_enabled  = self.state.track2_enabled;
@@ -319,6 +325,18 @@ fn draw_api_keys(ui: &mut egui::Ui, state: &mut UiState) {
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
+                ui.label("Speech-to-text:");
+                ui.add_enabled_ui(!running, |ui| {
+                    egui::ComboBox::from_id_salt("stt_provider")
+                        .selected_text(STT_PROVIDERS[state.stt_provider_idx].1)
+                        .show_ui(ui, |ui| {
+                            for (i, (_, name)) in STT_PROVIDERS.iter().enumerate() {
+                                ui.selectable_value(&mut state.stt_provider_idx, i, *name);
+                            }
+                        });
+                });
+                ui.end_row();
+
                 ui.label("Gemini (mic → translated audio):");
                 ui.add_enabled(
                     !running,
@@ -326,7 +344,7 @@ fn draw_api_keys(ui: &mut egui::Ui, state: &mut UiState) {
                 );
                 ui.end_row();
 
-                ui.label("Deepgram (Track 2 / fallback):");
+                ui.label("Deepgram (STT alternative):");
                 ui.add_enabled(
                     !running,
                     egui::TextEdit::singleline(&mut state.dg_key).password(true),
@@ -340,7 +358,7 @@ fn draw_api_keys(ui: &mut egui::Ui, state: &mut UiState) {
                 );
                 ui.end_row();
 
-                ui.label("ElevenLabs (TTS fallback):");
+                ui.label("ElevenLabs (Scribe STT + TTS):");
                 ui.add_enabled(
                     !running,
                     egui::TextEdit::singleline(&mut state.el_key).password(true),

@@ -27,7 +27,10 @@ pub struct AppConfig {
     pub gemini_model:  String,
 
     // ── Language ──────────────────────────────────────────────────────────
-    /// Deepgram STT source language. `None` = auto-detect (`language=multi`).
+    /// STT backend: `"scribe"` (ElevenLabs, default) or `"deepgram"`.
+    pub stt_provider:    String,
+    /// STT source language. `None` = auto-detect (Scribe server-side
+    /// detection, or Deepgram `language=multi`).
     pub source_lang:     Option<String>,
     /// DeepL target language for Track 1 (mic → TTS). e.g. `"DE"`.
     pub t1_target_lang:  String,
@@ -59,6 +62,7 @@ impl Default for AppConfig {
             gemini_api_key:    String::new(),
             gemini_model:      "gemini-3.5-live-translate-preview".to_owned(),
             source_lang:       None,
+            stt_provider:      "scribe".to_owned(),
             t1_target_lang:    "DE".to_owned(),
             t2_target_lang:    "EN".to_owned(),
             tts_sink_name:     Some("translator_virtmic_sink".to_owned()),
@@ -96,6 +100,7 @@ impl AppConfig {
         if let Ok(v) = std::env::var("VOICE_ID")          { cfg.voice_id  = v; }
         if let Ok(v) = std::env::var("GEMINI_API_KEY")    { cfg.gemini_api_key = v.trim().to_owned(); }
         if let Ok(v) = std::env::var("GEMINI_MODEL")      { cfg.gemini_model   = v.trim().to_owned(); }
+        if let Ok(v) = std::env::var("STT_PROVIDER")      { cfg.stt_provider   = v.trim().to_lowercase(); }
 
         cfg
     }
@@ -104,6 +109,7 @@ impl AppConfig {
         if let Some(lang) = t.t1_target_lang { self.t1_target_lang = lang; }
         if let Some(lang) = t.t2_target_lang { self.t2_target_lang = lang; }
         if let Some(lang) = t.source_lang    { self.source_lang = Some(lang); }
+        if let Some(p) = t.stt_provider      { self.stt_provider = p.to_lowercase(); }
         if let Some(sink) = t.tts_sink_name { self.tts_sink_name = Some(sink); }
         if let Some(v) = t.track2_enabled   { self.track2_enabled = v; }
         if let Some(v) = t.context_sentences { self.context_sentences = v; }
@@ -136,6 +142,7 @@ struct TomlFile {
     t1_target_lang:   Option<String>,
     t2_target_lang:   Option<String>,
     source_lang:      Option<String>,
+    stt_provider:     Option<String>,
     tts_sink_name:    Option<String>,
     track2_enabled:   Option<bool>,
     context_sentences: Option<usize>,

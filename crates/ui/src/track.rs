@@ -1,7 +1,7 @@
 //! Single-track pipeline runner.
 //!
-//! One track = one Deepgram WS + one TranscriptBuffer + optional DeepL +
-//! optional ElevenLabs → PipeWire sink.
+//! One track = one STT WS (ElevenLabs Scribe or Deepgram) + one
+//! TranscriptBuffer + optional DeepL + optional ElevenLabs → PipeWire sink.
 //!
 //! Outgoing (Track 1):  mic capture → STT → translate → TTS → virtmic
 //! Incoming (Track 2):  sink-monitor capture → STT → translate → subtitles only
@@ -19,7 +19,7 @@ use audio_os::{capture_indefinite, CaptureTarget, PlaybackFormat, PlaybackTarget
 use pipeline::{
     DeepgramClient, DeepgramConfig, DeepLClient, DeepLConfig, ElevenLabsConfig,
     FlushMode, GeminiClient, GeminiConfig, OUTPUT_SAMPLE_RATE, PipelineEvent,
-    ResampleState, TrackId, TranslationContext,
+    ResampleState, ScribeClient, ScribeConfig, TrackId, TranslationContext,
 };
 use tokio::sync::mpsc;
 
@@ -75,6 +75,30 @@ impl TrackSource {
     }
 }
 
+/// Which speech-to-text backend a track uses.
+#[derive(Debug, Clone)]
+pub enum SttConfig {
+    Deepgram { api_key: String },
+    Scribe   { api_key: String },
+}
+
+/// Unified handle over the STT backends so the capture thread doesn't
+/// care which provider is active.
+#[derive(Clone)]
+enum SttHandle {
+    Deepgram(pipeline::DeepgramHandle),
+    Scribe(pipeline::ScribeHandle),
+}
+
+impl SttHandle {
+    fn push_pcm(&self, samples: Vec<i16>) {
+        match self {
+            SttHandle::Deepgram(h) => h.push_pcm(samples),
+            SttHandle::Scribe(h)   => h.push_pcm(samples),
+        }
+    }
+}
+
 /// Configuration for one track.
 #[derive(Debug, Clone)]
 pub struct TrackConfig {
@@ -82,7 +106,7 @@ pub struct TrackConfig {
     pub source:    TrackSource,
 
     // STT
-    pub dg_api_key:  String,
+    pub stt:         SttConfig,
     pub source_lang: Option<String>, // None = Deepgram auto-detect
     // Translation (optional)
     pub deepl:       Option<DeeplTrackConfig>,
@@ -167,10 +191,16 @@ pub fn track_configs_from_app(
         None
     };
 
+    let stt = if cfg.stt_provider == "deepgram" {
+        SttConfig::Deepgram { api_key: cfg.dg_api_key.clone() }
+    } else {
+        SttConfig::Scribe { api_key: cfg.el_key.clone() }
+    };
+
     let t1 = TrackConfig {
         track_id:    TrackId::Outgoing,
         source:      TrackSource::Mic(mic_node),
-        dg_api_key:  cfg.dg_api_key.clone(),
+        stt:         stt.clone(),
         source_lang: cfg.source_lang.clone(),
         deepl:       make_deepl(t1_target_lang),
         gemini:      gemini_cfg,
@@ -182,7 +212,7 @@ pub fn track_configs_from_app(
         Some(TrackConfig {
             track_id:    TrackId::Incoming,
             source:      TrackSource::SinkMonitor(sink_node),
-            dg_api_key:  cfg.dg_api_key.clone(),
+            stt,
             source_lang: cfg.source_lang.clone(),
             deepl:       make_deepl(t2_target_lang),
             gemini:      None,
@@ -234,17 +264,34 @@ async fn run_track(
     let track_id = cfg.track_id;
     let log_track = cfg.source.log_track();
 
-    // ── Deepgram ───────────────────────────────────────────────────────────
-    let mut dg_cfg = match cfg.source_lang.as_deref() {
-        Some(lang) => DeepgramConfig::with_language(cfg.dg_api_key.clone(), lang),
-        None       => DeepgramConfig::with_detect_language(cfg.dg_api_key.clone()),
+    // ── STT ────────────────────────────────────────────────────────────────
+    let (stt_handle, mut stt_events) = match &cfg.stt {
+        SttConfig::Deepgram { api_key } => {
+            let mut dg_cfg = match cfg.source_lang.as_deref() {
+                Some(lang) => DeepgramConfig::with_language(api_key.clone(), lang),
+                None       => DeepgramConfig::with_detect_language(api_key.clone()),
+            };
+            dg_cfg.flush_mode = match track_id {
+                TrackId::Outgoing => FlushMode::SpeechFinal, // mic → TTS: quality over latency
+                TrackId::Incoming => FlushMode::IsFinal,     // subtitles: latency over quality
+            };
+            let (h, ev) = DeepgramClient::spawn(dg_cfg, track_id);
+            (SttHandle::Deepgram(h), ev)
+        }
+        SttConfig::Scribe { api_key } => {
+            let mut scribe_cfg = match cfg.source_lang.as_deref() {
+                Some(lang) => ScribeConfig::with_language(api_key.clone(), lang),
+                None       => ScribeConfig::new(api_key.clone()),
+            };
+            scribe_cfg.vad_silence_threshold_secs = match track_id {
+                TrackId::Outgoing => 1.5, // mic → TTS: complete sentences
+                TrackId::Incoming => 1.0, // subtitles: lower latency
+            };
+            let (h, ev) = ScribeClient::spawn(scribe_cfg, track_id);
+            (SttHandle::Scribe(h), ev)
+        }
     };
-    dg_cfg.flush_mode = match track_id {
-        TrackId::Outgoing => FlushMode::SpeechFinal, // mic → TTS: quality over latency
-        TrackId::Incoming => FlushMode::IsFinal,     // subtitles: latency over quality
-    };
-    let (dg_handle, mut dg_events) = DeepgramClient::spawn(dg_cfg, track_id);
-    let dg_handle = Arc::new(dg_handle);
+    let stt_handle = Arc::new(stt_handle);
 
     // ── DeepL ──────────────────────────────────────────────────────────────
     let deepl_state: Option<(DeepLClient, String, TranslationContext)> =
@@ -292,9 +339,9 @@ async fn run_track(
     };
 
     // ── Capture thread ─────────────────────────────────────────────────────
-    // Runs on a blocking OS thread; pushes resampled i16 to Deepgram.
+    // Runs on a blocking OS thread; pushes resampled i16 to the STT stream.
     let capture_target = resolve_capture_target(&cfg.source);
-    let dg_h = dg_handle.clone();
+    let stt_h = stt_handle.clone();
     let stop_cap = stop.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -323,7 +370,7 @@ async fn run_track(
                 let (rs, _, _) = state.as_mut().unwrap();
                 if let Ok(pcm16) = rs.push(samples) {
                     if !pcm16.is_empty() {
-                        dg_h.push_pcm(pcm16);
+                        stt_h.push_pcm(pcm16);
                     }
                 }
             },
@@ -358,7 +405,7 @@ async fn run_track(
                 }
 
                 if let Some(text) = current.take() {
-                    if text.trim().len() < 5 {
+                    if text.trim().chars().count() < 5 {
                         continue;
                     }
                     last_tx = now;
@@ -393,19 +440,19 @@ async fn run_track(
     let mut deepl_state = deepl_state;
 
     loop {
-        // Check stop flag — if set, drop dg_handle to close the WS.
+        // Check stop flag — if set, drop stt_handle to close the WS.
         if stop.load(Ordering::Acquire) {
-            log::info!("Track {:?}: stop flag set, closing Deepgram WS", track_id);
+            log::info!("Track {:?}: stop flag set, closing STT WS", track_id);
             break;
         }
 
-        match tokio::time::timeout(Duration::from_millis(100), dg_events.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(100), stt_events.recv()).await {
             Err(_timeout) => {
                 // No event in 100ms — re-check stop flag on next iteration.
                 continue;
             }
             Ok(None) => {
-                // Channel closed (Deepgram WS ended).
+                // Channel closed (STT WS ended).
                 break;
             }
             Ok(Some(evt)) => {
