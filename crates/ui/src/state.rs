@@ -50,19 +50,125 @@ pub enum SessionStatus {
 // ── Language list ──────────────────────────────────────────────────────────
 
 pub const SUPPORTED_LANGS: &[(&str, &str)] = &[
-    ("EN", "English"),
-    ("DE", "German"),
+    ("AF", "Afrikaans"),
+    ("AK", "Akan"),
+    ("SQ", "Albanian"),
+    ("AM", "Amharic"),
+    ("AR", "Arabic"),
+    ("HY", "Armenian"),
+    ("AZ", "Azerbaijani"),
+    ("EU", "Basque"),
+    ("BE", "Belarusian"),
+    ("BN", "Bengali"),
+    ("BG", "Bulgarian"),
+    ("MY", "Burmese"),
+    ("CA", "Catalan"),
+    ("ZH", "Chinese (Simplified)"),
+    ("ZH-HANT", "Chinese (Traditional)"),
+    ("HR", "Croatian"),
+    ("CS", "Czech"),
+    ("DA", "Danish"),
     ("NL", "Dutch"),
+    ("EN", "English"),
     ("ET", "Estonian"),
-    ("IT", "Italian"),
-    ("ES", "Spanish"),
+    ("FIL", "Filipino"),
+    ("FI", "Finnish"),
     ("FR", "French"),
+    ("GL", "Galician"),
+    ("KA", "Georgian"),
+    ("DE", "German"),
+    ("EL", "Greek"),
+    ("GU", "Gujarati"),
+    ("HA", "Hausa"),
+    ("HE", "Hebrew"),
+    ("HI", "Hindi"),
+    ("HU", "Hungarian"),
+    ("IS", "Icelandic"),
+    ("ID", "Indonesian"),
+    ("IT", "Italian"),
+    ("JA", "Japanese"),
+    ("JV", "Javanese"),
+    ("KN", "Kannada"),
+    ("KK", "Kazakh"),
+    ("KM", "Khmer"),
+    ("RW", "Kinyarwanda"),
+    ("KO", "Korean"),
+    ("LO", "Lao"),
+    ("LV", "Latvian"),
+    ("LT", "Lithuanian"),
+    ("MK", "Macedonian"),
+    ("MS", "Malay"),
+    ("ML", "Malayalam"),
+    ("MR", "Marathi"),
+    ("MN", "Mongolian"),
+    ("NE", "Nepali"),
+    ("NO", "Norwegian"),
+    ("FA", "Persian"),
     ("PL", "Polish"),
-    ("PT-PT", "Portuguese"),
+    ("PT-BR", "Portuguese (Brazil)"),
+    ("PT-PT", "Portuguese (Portugal)"),
+    ("PA", "Punjabi"),
+    ("RO", "Romanian"),
     ("RU", "Russian"),
-    ("ZH", "Chinese"),
+    ("SR", "Serbian"),
+    ("SD", "Sindhi"),
+    ("SI", "Sinhala"),
+    ("SK", "Slovak"),
+    ("SL", "Slovenian"),
+    ("ES", "Spanish"),
+    ("SU", "Sundanese"),
+    ("SW", "Swahili"),
+    ("SV", "Swedish"),
+    ("TA", "Tamil"),
+    ("TE", "Telugu"),
+    ("TH", "Thai"),
+    ("TR", "Turkish"),
+    ("UK", "Ukrainian"),
+    ("UR", "Urdu"),
+    ("UZ", "Uzbek"),
+    ("VI", "Vietnamese"),
+    ("ZU", "Zulu"),
+];
+
+// Target languages supported by the DeepL text-translation API (Track 2 and
+// the Track 1 fallback when no Gemini key is configured).
+pub const DEEPL_TARGET_LANGS: &[(&str, &str)] = &[
+    ("AR", "Arabic"),
+    ("BG", "Bulgarian"),
+    ("ZH-HANS", "Chinese (Simplified)"),
+    ("ZH-HANT", "Chinese (Traditional)"),
+    ("CS", "Czech"),
+    ("DA", "Danish"),
+    ("NL", "Dutch"),
+    ("EN-US", "English (American)"),
+    ("EN-GB", "English (British)"),
+    ("ET", "Estonian"),
+    ("FI", "Finnish"),
+    ("FR", "French"),
+    ("DE", "German"),
+    ("EL", "Greek"),
+    ("HE", "Hebrew"),
+    ("HU", "Hungarian"),
+    ("ID", "Indonesian"),
+    ("IT", "Italian"),
     ("JA", "Japanese"),
     ("KO", "Korean"),
+    ("LV", "Latvian"),
+    ("LT", "Lithuanian"),
+    ("NB", "Norwegian (Bokmål)"),
+    ("PL", "Polish"),
+    ("PT-BR", "Portuguese (Brazil)"),
+    ("PT-PT", "Portuguese (Portugal)"),
+    ("RO", "Romanian"),
+    ("RU", "Russian"),
+    ("SK", "Slovak"),
+    ("SL", "Slovenian"),
+    ("ES", "Spanish"),
+    ("SV", "Swedish"),
+    ("TH", "Thai"),
+    ("TR", "Turkish"),
+    ("UK", "Ukrainian"),
+    ("VI", "Vietnamese"),
 ];
 
 // ── Main state struct ──────────────────────────────────────────────────────
@@ -76,7 +182,7 @@ pub struct UiState {
     pub selected_sink_idx:   Option<usize>, // index into nodes (Sink class) for Track 2
     /// Track 1 (mic → TTS) target language index into SUPPORTED_LANGS.
     pub t1_target_lang_idx:  usize,
-    /// Track 2 (incoming audio → subtitles) target language index into SUPPORTED_LANGS.
+    /// Track 2 (incoming audio → subtitles) target language index into DEEPL_TARGET_LANGS.
     pub t2_target_lang_idx:  usize,
 
     // ── Config fields (editable before session start) ─────────────────────
@@ -133,11 +239,14 @@ impl UiState {
         let t1_target_lang_idx = SUPPORTED_LANGS
             .iter()
             .position(|(code, _)| *code == cfg.t1_target_lang.as_str())
-            .unwrap_or(1); // default to DE
-        let t2_target_lang_idx = SUPPORTED_LANGS
+            .or_else(|| SUPPORTED_LANGS.iter().position(|(code, _)| *code == "DE"))
+            .unwrap_or(0); // default to DE
+        let t2_code = pipeline::normalize_target_code(&cfg.t2_target_lang);
+        let t2_target_lang_idx = DEEPL_TARGET_LANGS
             .iter()
-            .position(|(code, _)| *code == cfg.t2_target_lang.as_str())
-            .unwrap_or(0); // default to EN
+            .position(|(code, _)| *code == t2_code)
+            .or_else(|| DEEPL_TARGET_LANGS.iter().position(|(code, _)| *code == "EN-US"))
+            .unwrap_or(0); // default to EN-US
 
         Self {
             nodes: Vec::new(),
@@ -282,12 +391,12 @@ impl UiState {
             .unwrap_or("DE")
     }
 
-    /// Track 2 target language code (incoming audio → subtitles), e.g. `"EN"`.
+    /// Track 2 target language code (incoming audio → subtitles), e.g. `"EN-US"`.
     pub fn t2_target_lang(&self) -> &str {
-        SUPPORTED_LANGS
+        DEEPL_TARGET_LANGS
             .get(self.t2_target_lang_idx)
             .map(|(code, _)| *code)
-            .unwrap_or("EN")
+            .unwrap_or("EN-US")
     }
 
     /// Selected mic node id.

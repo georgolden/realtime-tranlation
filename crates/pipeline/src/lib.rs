@@ -17,7 +17,7 @@ mod resample;
 mod transcript;
 
 pub use deepgram::{DeepgramClient, DeepgramConfig, DeepgramHandle, FlushMode};
-pub use deepl::{DeepLClient, DeepLConfig, TranslationContext};
+pub use deepl::{normalize_target_code, DeepLClient, DeepLConfig, TranslationContext};
 pub use elevenlabs::{elevenlabs_spawn, ElevenLabsConfig};
 pub use events::{PipelineEvent, TrackId};
 pub use gemini::{bcp47_from_deepl, GeminiClient, GeminiConfig, GeminiHandle, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE};

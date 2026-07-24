@@ -18,7 +18,7 @@ use pipeline::TranscriptBufferConfig;
 
 use crate::config::AppConfig;
 use crate::session::{start_session, SessionHandle};
-use crate::state::{SessionStatus, SubtitleLine, UiState, SUPPORTED_LANGS};
+use crate::state::{SessionStatus, SubtitleLine, UiState, DEEPL_TARGET_LANGS, SUPPORTED_LANGS};
 
 // ── App ────────────────────────────────────────────────────────────────────
 
@@ -60,6 +60,16 @@ impl TranslatorApp {
         if self.state.gemini_key.is_empty() && self.state.deepl_key.is_empty() {
             self.state.errors.insert(0, "Provide either GEMINI_API_KEY or DEEPL_API_KEY.".into());
             return;
+        }
+        if self.state.gemini_key.is_empty() {
+            let t1 = pipeline::normalize_target_code(self.state.t1_target_lang());
+            if !DEEPL_TARGET_LANGS.iter().any(|(code, _)| *code == t1) {
+                self.state.errors.insert(0, format!(
+                    "Track 1 target '{}' is not supported without a Gemini key (DeepL fallback).",
+                    self.state.t1_target_lang()
+                ));
+                return;
+            }
         }
 
         // Build a live AppConfig from what the user typed in the UI.
@@ -275,12 +285,12 @@ fn draw_audio_config(ui: &mut egui::Ui, state: &mut UiState) {
                     ui.label("Incoming translates to:");
                     ui.add_enabled_ui(!running, |ui| {
                         egui::ComboBox::from_id_salt("t2_target_lang")
-                            .selected_text(SUPPORTED_LANGS[state.t2_target_lang_idx].1)
-                            .show_ui(ui, |ui| {
-                                for (i, (_, name)) in SUPPORTED_LANGS.iter().enumerate() {
-                                    ui.selectable_value(&mut state.t2_target_lang_idx, i, *name);
-                                }
-                            });
+                    .selected_text(DEEPL_TARGET_LANGS[state.t2_target_lang_idx].1)
+                    .show_ui(ui, |ui| {
+                        for (i, (_, name)) in DEEPL_TARGET_LANGS.iter().enumerate() {
+                            ui.selectable_value(&mut state.t2_target_lang_idx, i, *name);
+                        }
+                    });
                     });
                     ui.end_row();
                 }

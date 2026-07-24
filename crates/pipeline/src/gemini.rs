@@ -64,6 +64,7 @@ pub fn bcp47_from_deepl(code: &str) -> String {
         "zh-hant" => "zh-Hant".into(),
         "ja" => "ja".into(),
         "ko" => "ko".into(),
+        "uk" => "uk".into(),
         other => other.to_string(),
     }
 }
@@ -776,6 +777,13 @@ mod tests {
         assert_eq!(bcp47_from_deepl("PT-PT"), "pt-PT");
         assert_eq!(bcp47_from_deepl("ZH"), "zh-Hans");
         assert_eq!(bcp47_from_deepl("et"), "et");
+        // Unlisted codes pass through lowercased (valid BCP-47 for the
+        // remaining Live Translate languages).
+        assert_eq!(bcp47_from_deepl("AF"), "af");
+        assert_eq!(bcp47_from_deepl("SQ"), "sq");
+        assert_eq!(bcp47_from_deepl("FIL"), "fil");
+        assert_eq!(bcp47_from_deepl("HE"), "he");
+        assert_eq!(bcp47_from_deepl("UK"), "uk");
     }
 
     #[test]

@@ -28,6 +28,19 @@ pub struct DeepLConfig {
     pub context_sentences: usize,
 }
 
+/// Normalize a UI/legacy language code to the DeepL target-language form:
+/// uppercases and maps bare codes to the variants DeepL requires as targets
+/// (`EN` → `EN-US`, `PT` → `PT-PT`, `NO` → `NB`, `ZH` → `ZH-HANS`).
+pub fn normalize_target_code(code: &str) -> String {
+    match code.to_uppercase().as_str() {
+        "EN" => "EN-US".into(),
+        "PT" => "PT-PT".into(),
+        "NO" => "NB".into(),
+        "ZH" => "ZH-HANS".into(),
+        other => other.to_string(),
+    }
+}
+
 impl DeepLConfig {
     /// `source_lang = None` → auto-detect. Pass `Some("DE")` to pin.
     pub fn new(
@@ -43,7 +56,7 @@ impl DeepLConfig {
         Self {
             api_key,
             source_lang: source_lang.map(|s| s.to_uppercase()),
-            target_lang: target_lang.to_uppercase(),
+            target_lang: normalize_target_code(target_lang),
             model_type:  "latency_optimized".into(),
             endpoint:    endpoint.into(),
             context_sentences: 5,
@@ -231,5 +244,18 @@ mod tests {
     fn source_lang_explicit_uppercased() {
         let cfg = DeepLConfig::new("key".into(), Some("en"), "de");
         assert_eq!(cfg.source_lang, Some("EN".into()));
+    }
+
+    #[test]
+    fn target_lang_normalized_to_deepl_variants() {
+        assert_eq!(normalize_target_code("EN"), "EN-US");
+        assert_eq!(normalize_target_code("en"), "EN-US");
+        assert_eq!(normalize_target_code("PT"), "PT-PT");
+        assert_eq!(normalize_target_code("NO"), "NB");
+        assert_eq!(normalize_target_code("ZH"), "ZH-HANS");
+        assert_eq!(normalize_target_code("UK"), "UK");
+        assert_eq!(normalize_target_code("ZH-HANT"), "ZH-HANT");
+        let cfg = DeepLConfig::new("key".into(), None, "en");
+        assert_eq!(cfg.target_lang, "EN-US");
     }
 }
