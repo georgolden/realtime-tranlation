@@ -171,6 +171,13 @@ pub const DEEPL_TARGET_LANGS: &[(&str, &str)] = &[
     ("VI", "Vietnamese"),
 ];
 
+// ── STT providers ──────────────────────────────────────────────────────────
+
+pub const STT_PROVIDERS: &[(&str, &str)] = &[
+    ("scribe",   "ElevenLabs Scribe"),
+    ("deepgram", "Deepgram"),
+];
+
 // ── Main state struct ──────────────────────────────────────────────────────
 
 pub struct UiState {
@@ -189,6 +196,8 @@ pub struct UiState {
     pub tts_sink_name:        String,
     pub track2_enabled:       bool,
     pub context_sentences:    usize,
+    /// Index into STT_PROVIDERS — which STT backend tracks use.
+    pub stt_provider_idx:     usize,
 
     // Transcript buffer tuning (displayed in "Advanced")
     pub silence_flush_ms:     u32,
@@ -257,6 +266,10 @@ impl UiState {
             overlay_lines:       5,
             tts_sink_name:       cfg.tts_sink_name.clone().unwrap_or_default(),
             track2_enabled:      cfg.track2_enabled,
+            stt_provider_idx:    STT_PROVIDERS
+                .iter()
+                .position(|(id, _)| *id == cfg.stt_provider.as_str())
+                .unwrap_or(0),
             context_sentences:  cfg.context_sentences,
             silence_flush_ms:   cfg.buf.silence_flush.as_millis() as u32,
             min_chars_punct:    cfg.buf.min_chars_for_punct_flush,
@@ -397,6 +410,14 @@ impl UiState {
             .get(self.t2_target_lang_idx)
             .map(|(code, _)| *code)
             .unwrap_or("EN-US")
+    }
+
+    /// Selected STT provider id (`"scribe"` or `"deepgram"`).
+    pub fn stt_provider(&self) -> &str {
+        STT_PROVIDERS
+            .get(self.stt_provider_idx)
+            .map(|(id, _)| *id)
+            .unwrap_or("scribe")
     }
 
     /// Selected mic node id.

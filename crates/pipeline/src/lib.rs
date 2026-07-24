@@ -14,6 +14,7 @@ mod elevenlabs;
 mod events;
 mod gemini;
 mod resample;
+mod scribe;
 mod transcript;
 
 pub use deepgram::{DeepgramClient, DeepgramConfig, DeepgramHandle, FlushMode};
@@ -22,6 +23,7 @@ pub use elevenlabs::{elevenlabs_spawn, ElevenLabsConfig};
 pub use events::{PipelineEvent, TrackId};
 pub use gemini::{bcp47_from_deepl, GeminiClient, GeminiConfig, GeminiHandle, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE};
 pub use resample::{resample_to_deepgram, ResampleState};
+pub use scribe::{ScribeClient, ScribeConfig, ScribeHandle};
 pub use transcript::{FlushReason, TranscriptBuffer, TranscriptBufferConfig};
 
 use std::sync::Once;
@@ -49,6 +51,8 @@ pub enum PipelineError {
     Json(#[from] serde_json::Error),
     #[error("deepgram api error: {0}")]
     Deepgram(String),
+    #[error("scribe api error: {0}")]
+    Scribe(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("resampler error: {0}")]
