@@ -154,6 +154,7 @@ pub fn track_configs_from_app(
     cfg:             &AppConfig,
     mic_node:        Option<u32>,
     sink_node:       Option<u32>,
+    t2_mic_node:     Option<u32>,
     t1_target_lang:  &str,
     t2_target_lang:  &str,
 ) -> (TrackConfig, Option<TrackConfig>) {
@@ -209,9 +210,14 @@ pub fn track_configs_from_app(
     };
 
     let t2 = if cfg.track2_enabled && cfg.has_deepl() {
+        let source = if cfg.t2_uses_mic() {
+            TrackSource::Mic(t2_mic_node)
+        } else {
+            TrackSource::SinkMonitor(sink_node)
+        };
         Some(TrackConfig {
             track_id:    TrackId::Incoming,
-            source:      TrackSource::SinkMonitor(sink_node),
+            source,
             stt,
             source_lang: cfg.source_lang.clone(),
             deepl:       make_deepl(t2_target_lang),
@@ -262,7 +268,10 @@ async fn run_track(
     event_tx: mpsc::Sender<TrackEvent>,
 ) -> anyhow::Result<()> {
     let track_id = cfg.track_id;
-    let log_track = cfg.source.log_track();
+    let log_track = match track_id {
+        TrackId::Outgoing => LogTrack::Mic,
+        TrackId::Incoming => LogTrack::Audio,
+    };
 
     // ── STT ────────────────────────────────────────────────────────────────
     let (stt_handle, mut stt_events) = match &cfg.stt {

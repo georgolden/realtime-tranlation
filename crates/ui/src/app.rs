@@ -18,7 +18,7 @@ use pipeline::TranscriptBufferConfig;
 
 use crate::config::AppConfig;
 use crate::session::{start_session, SessionHandle};
-use crate::state::{SessionStatus, SubtitleLine, UiState, DEEPL_TARGET_LANGS, STT_PROVIDERS, SUPPORTED_LANGS};
+use crate::state::{SessionStatus, SubtitleLine, UiState, DEEPL_TARGET_LANGS, STT_PROVIDERS, SUPPORTED_LANGS, T2_SOURCES};
 
 // ── App ────────────────────────────────────────────────────────────────────
 
@@ -88,6 +88,7 @@ impl TranslatorApp {
         cfg.t1_target_lang  = self.state.t1_target_lang().to_owned();
         cfg.t2_target_lang  = self.state.t2_target_lang().to_owned();
         cfg.track2_enabled  = self.state.track2_enabled;
+        cfg.t2_source       = self.state.t2_source().to_owned();
         cfg.context_sentences = self.state.context_sentences;
         cfg.tts_sink_name = if self.state.tts_sink_name.trim().is_empty() {
             None
@@ -107,6 +108,7 @@ impl TranslatorApp {
             &cfg,
             self.state.mic_node_id(),
             self.state.sink_node_id(),
+            self.state.t2_mic_node_id(),
             &t1_lang,
             &t2_lang,
             self.rt.clone(),
@@ -271,21 +273,52 @@ fn draw_audio_config(ui: &mut egui::Ui, state: &mut UiState) {
                 ui.end_row();
 
                 if state.track2_enabled {
-                    ui.label("Audio source:");
-                    egui::ComboBox::from_id_salt("sink_pick")
-                        .selected_text(node_label(state, state.selected_sink_idx))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut state.selected_sink_idx, None, "Default sink monitor");
-                            let sink_idxs: Vec<usize> = state.nodes.iter().enumerate()
-                                .filter(|(_, n)| matches!(n.class, audio_os::MediaClass::Sink))
-                                .map(|(i, _)| i)
-                                .collect();
-                            for i in sink_idxs {
-                                let label = format!("{} ({})", state.nodes[i].description, state.nodes[i].name);
-                                ui.selectable_value(&mut state.selected_sink_idx, Some(i), label);
-                            }
-                        });
+                    // Track 2 capture source: output (sink monitor) or input (mic)
+                    ui.label("Subtitles listen to:");
+                    ui.add_enabled_ui(!running, |ui| {
+                        egui::ComboBox::from_id_salt("t2_source")
+                            .selected_text(T2_SOURCES[state.t2_source_idx].1)
+                            .show_ui(ui, |ui| {
+                                for (i, (_, name)) in T2_SOURCES.iter().enumerate() {
+                                    ui.selectable_value(&mut state.t2_source_idx, i, *name);
+                                }
+                            });
+                    });
                     ui.end_row();
+
+                    if state.t2_source() == "output" {
+                        ui.label("Audio source:");
+                        egui::ComboBox::from_id_salt("sink_pick")
+                            .selected_text(node_label(state, state.selected_sink_idx))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut state.selected_sink_idx, None, "Default sink monitor");
+                                let sink_idxs: Vec<usize> = state.nodes.iter().enumerate()
+                                    .filter(|(_, n)| matches!(n.class, audio_os::MediaClass::Sink))
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                for i in sink_idxs {
+                                    let label = format!("{} ({})", state.nodes[i].description, state.nodes[i].name);
+                                    ui.selectable_value(&mut state.selected_sink_idx, Some(i), label);
+                                }
+                            });
+                        ui.end_row();
+                    } else {
+                        ui.label("Input source:");
+                        egui::ComboBox::from_id_salt("t2_mic_pick")
+                            .selected_text(node_label(state, state.selected_t2_mic_idx))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut state.selected_t2_mic_idx, None, "Default");
+                                let source_idxs: Vec<usize> = state.nodes.iter().enumerate()
+                                    .filter(|(_, n)| matches!(n.class, audio_os::MediaClass::Source))
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                for i in source_idxs {
+                                    let label = format!("{} ({})", state.nodes[i].description, state.nodes[i].name);
+                                    ui.selectable_value(&mut state.selected_t2_mic_idx, Some(i), label);
+                                }
+                            });
+                        ui.end_row();
+                    }
 
                     // Track 2 target language (incoming audio → subtitles)
                     ui.label("Incoming translates to:");

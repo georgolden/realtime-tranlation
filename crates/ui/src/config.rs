@@ -44,6 +44,9 @@ pub struct AppConfig {
 
     // ── Track 2 (incoming audio → subtitles) ─────────────────────────────
     pub track2_enabled: bool,
+    /// Where Track 2 (subtitles) captures from: `"output"` (default sink
+    /// monitor — what you hear) or `"input"` (microphone — what you say).
+    pub t2_source:      String,
 
     // ── Transcript buffer ─────────────────────────────────────────────────
     pub buf: TranscriptBufferConfig,
@@ -67,6 +70,7 @@ impl Default for AppConfig {
             t2_target_lang:    "EN".to_owned(),
             tts_sink_name:     Some("translator_virtmic_sink".to_owned()),
             track2_enabled:    true,
+            t2_source:         "output".to_owned(),
             buf:               TranscriptBufferConfig::default(),
             context_sentences: 5,
         }
@@ -101,6 +105,7 @@ impl AppConfig {
         if let Ok(v) = std::env::var("GEMINI_API_KEY")    { cfg.gemini_api_key = v.trim().to_owned(); }
         if let Ok(v) = std::env::var("GEMINI_MODEL")      { cfg.gemini_model   = v.trim().to_owned(); }
         if let Ok(v) = std::env::var("STT_PROVIDER")      { cfg.stt_provider   = v.trim().to_lowercase(); }
+        if let Ok(v) = std::env::var("T2_SOURCE")         { cfg.t2_source      = v.trim().to_lowercase(); }
 
         cfg
     }
@@ -112,6 +117,7 @@ impl AppConfig {
         if let Some(p) = t.stt_provider      { self.stt_provider = p.to_lowercase(); }
         if let Some(sink) = t.tts_sink_name { self.tts_sink_name = Some(sink); }
         if let Some(v) = t.track2_enabled   { self.track2_enabled = v; }
+        if let Some(v) = t.t2_source        { self.t2_source = v.to_lowercase(); }
         if let Some(v) = t.context_sentences { self.context_sentences = v; }
 
         if let Some(b) = t.buffer {
@@ -133,6 +139,8 @@ impl AppConfig {
     pub fn has_deepl(&self) -> bool  { !self.deepl_key.is_empty() }
     pub fn has_tts(&self)   -> bool  { !self.el_key.is_empty() && !self.voice_id.is_empty() }
     pub fn has_gemini(&self) -> bool { !self.gemini_api_key.is_empty() }
+    /// Track 2 (subtitles) captures from the microphone instead of the sink monitor.
+    pub fn t2_uses_mic(&self) -> bool { self.t2_source == "input" }
 }
 
 // ── TOML deserialization schema ────────────────────────────────────────────
@@ -145,6 +153,7 @@ struct TomlFile {
     stt_provider:     Option<String>,
     tts_sink_name:    Option<String>,
     track2_enabled:   Option<bool>,
+    t2_source:        Option<String>,
     context_sentences: Option<usize>,
     buffer:           Option<TomlBuffer>,
 }

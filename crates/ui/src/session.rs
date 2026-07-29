@@ -47,6 +47,7 @@ pub fn start_session(
     cfg:            &AppConfig,
     mic_node:       Option<u32>,
     sink_node:      Option<u32>,
+    t2_mic_node:    Option<u32>,
     t1_target_lang: &str,
     t2_target_lang: &str,
     rt:             Arc<tokio::runtime::Runtime>,
@@ -58,7 +59,7 @@ pub fn start_session(
     let (merged_tx, merged_rx) = mpsc::channel::<SessionEvent>(512);
 
     let (t1_cfg, t2_cfg) =
-        track_configs_from_app(cfg, mic_node, sink_node, t1_target_lang, t2_target_lang);
+        track_configs_from_app(cfg, mic_node, sink_node, t2_mic_node, t1_target_lang, t2_target_lang);
 
     // Track 1 — always started.
     let mut t1_rx = spawn_track(t1_cfg, stop.clone(), log.clone(), rt.clone());

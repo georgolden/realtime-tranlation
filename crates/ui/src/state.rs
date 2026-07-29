@@ -178,6 +178,13 @@ pub const STT_PROVIDERS: &[(&str, &str)] = &[
     ("deepgram", "Deepgram"),
 ];
 
+// ── Track 2 (subtitles) capture source ─────────────────────────────────────
+
+pub const T2_SOURCES: &[(&str, &str)] = &[
+    ("output", "Output (what you hear)"),
+    ("input",  "Input (your microphone)"),
+];
+
 // ── Main state struct ──────────────────────────────────────────────────────
 
 pub struct UiState {
@@ -187,6 +194,9 @@ pub struct UiState {
     // ── User selections ───────────────────────────────────────────────────
     pub selected_mic_idx:    Option<usize>, // index into nodes (Source class)
     pub selected_sink_idx:   Option<usize>, // index into nodes (Sink class) for Track 2
+    /// Index into nodes (Source class) — input device for Track 2 when
+    /// "Subtitles listen to: Input" is selected.
+    pub selected_t2_mic_idx: Option<usize>,
     /// Track 1 (mic → TTS) target language index into SUPPORTED_LANGS.
     pub t1_target_lang_idx:  usize,
     /// Track 2 (incoming audio → subtitles) target language index into DEEPL_TARGET_LANGS.
@@ -195,6 +205,8 @@ pub struct UiState {
     // ── Config fields (editable before session start) ─────────────────────
     pub tts_sink_name:        String,
     pub track2_enabled:       bool,
+    /// Index into T2_SOURCES — where the subtitles track captures from.
+    pub t2_source_idx:        usize,
     pub context_sentences:    usize,
     /// Index into STT_PROVIDERS — which STT backend tracks use.
     pub stt_provider_idx:     usize,
@@ -261,11 +273,16 @@ impl UiState {
             nodes: Vec::new(),
             selected_mic_idx:    None,
             selected_sink_idx:   None,
+            selected_t2_mic_idx: None,
             t1_target_lang_idx,
             t2_target_lang_idx,
             overlay_lines:       5,
             tts_sink_name:       cfg.tts_sink_name.clone().unwrap_or_default(),
             track2_enabled:      cfg.track2_enabled,
+            t2_source_idx:       T2_SOURCES
+                .iter()
+                .position(|(id, _)| *id == cfg.t2_source.as_str())
+                .unwrap_or(0),
             stt_provider_idx:    STT_PROVIDERS
                 .iter()
                 .position(|(id, _)| *id == cfg.stt_provider.as_str())
@@ -310,6 +327,12 @@ impl UiState {
                         .nodes
                         .iter()
                         .position(|n| matches!(n.class, MediaClass::Sink));
+                }
+                if self.selected_t2_mic_idx.is_none() {
+                    self.selected_t2_mic_idx = self
+                        .nodes
+                        .iter()
+                        .position(|n| matches!(n.class, MediaClass::Source));
                 }
             }
             Err(e) => self.push_error(format!("PipeWire node list: {e}")),
@@ -420,6 +443,14 @@ impl UiState {
             .unwrap_or("scribe")
     }
 
+    /// Selected Track 2 capture source id (`"output"` or `"input"`).
+    pub fn t2_source(&self) -> &str {
+        T2_SOURCES
+            .get(self.t2_source_idx)
+            .map(|(id, _)| *id)
+            .unwrap_or("output")
+    }
+
     /// Selected mic node id.
     pub fn mic_node_id(&self) -> Option<u32> {
         self.selected_mic_idx
@@ -430,6 +461,13 @@ impl UiState {
     /// Selected sink node id.
     pub fn sink_node_id(&self) -> Option<u32> {
         self.selected_sink_idx
+            .and_then(|i| self.nodes.get(i))
+            .map(|n| n.id)
+    }
+
+    /// Selected Track 2 input (mic) node id.
+    pub fn t2_mic_node_id(&self) -> Option<u32> {
+        self.selected_t2_mic_idx
             .and_then(|i| self.nodes.get(i))
             .map(|n| n.id)
     }
