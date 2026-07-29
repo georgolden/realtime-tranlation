@@ -18,7 +18,7 @@ use pipeline::TranscriptBufferConfig;
 
 use crate::config::AppConfig;
 use crate::session::{start_session, SessionHandle};
-use crate::state::{SessionStatus, SubtitleLine, UiState, DEEPL_TARGET_LANGS, STT_PROVIDERS, SUPPORTED_LANGS, T2_SOURCES};
+use crate::state::{SessionStatus, SubtitleLine, UiState, DEEPL_TARGET_LANGS, STT_PROVIDERS, SUPPORTED_LANGS, T2_SOURCES, T2_SPEECH_PACES};
 
 // ── App ────────────────────────────────────────────────────────────────────
 
@@ -89,6 +89,7 @@ impl TranslatorApp {
         cfg.t2_target_lang  = self.state.t2_target_lang().to_owned();
         cfg.track2_enabled  = self.state.track2_enabled;
         cfg.t2_source       = self.state.t2_source().to_owned();
+        cfg.t2_speech_pace  = self.state.t2_speech_pace().to_owned();
         cfg.context_sentences = self.state.context_sentences;
         cfg.tts_sink_name = if self.state.tts_sink_name.trim().is_empty() {
             None
@@ -281,6 +282,19 @@ fn draw_audio_config(ui: &mut egui::Ui, state: &mut UiState) {
                             .show_ui(ui, |ui| {
                                 for (i, (_, name)) in T2_SOURCES.iter().enumerate() {
                                     ui.selectable_value(&mut state.t2_source_idx, i, *name);
+                                }
+                            });
+                    });
+                    ui.end_row();
+
+                    // Track 2 speech pace: Scribe VAD preset
+                    ui.label("Speech pace:");
+                    ui.add_enabled_ui(!running, |ui| {
+                        egui::ComboBox::from_id_salt("t2_pace")
+                            .selected_text(T2_SPEECH_PACES[state.t2_pace_idx].1)
+                            .show_ui(ui, |ui| {
+                                for (i, (_, name)) in T2_SPEECH_PACES.iter().enumerate() {
+                                    ui.selectable_value(&mut state.t2_pace_idx, i, *name);
                                 }
                             });
                     });

@@ -20,6 +20,7 @@ use pipeline::{
     DeepgramClient, DeepgramConfig, DeepLClient, DeepLConfig, ElevenLabsConfig,
     FlushMode, GeminiClient, GeminiConfig, OUTPUT_SAMPLE_RATE, PipelineEvent,
     ResampleState, ScribeClient, ScribeConfig, TrackId, TranslationContext,
+    VadPreset,
 };
 use tokio::sync::mpsc;
 
@@ -119,6 +120,9 @@ pub struct TrackConfig {
 
     // Playback sink name for outgoing audio (used by Gemini or TTS).
     pub playback_sink_name: Option<String>,
+
+    // Scribe VAD preset (only used when the Scribe STT backend is active).
+    pub vad_preset: VadPreset,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +211,7 @@ pub fn track_configs_from_app(
         gemini:      gemini_cfg,
         tts:         tts_cfg,
         playback_sink_name: cfg.tts_sink_name.clone(),
+        vad_preset:  VadPreset::DEFAULT, // mic → TTS: complete sentences
     };
 
     let t2 = if cfg.track2_enabled && cfg.has_deepl() {
@@ -214,6 +219,11 @@ pub fn track_configs_from_app(
             TrackSource::Mic(t2_mic_node)
         } else {
             TrackSource::SinkMonitor(sink_node)
+        };
+        let vad_preset = if cfg.t2_fast_speech() {
+            VadPreset::FAST_SPEECH
+        } else {
+            VadPreset::SLOW_SPEECH
         };
         Some(TrackConfig {
             track_id:    TrackId::Incoming,
@@ -224,6 +234,7 @@ pub fn track_configs_from_app(
             gemini:      None,
             tts:         None,
             playback_sink_name: None,
+            vad_preset,
         })
     } else {
         None
@@ -292,10 +303,7 @@ async fn run_track(
                 Some(lang) => ScribeConfig::with_language(api_key.clone(), lang),
                 None       => ScribeConfig::new(api_key.clone()),
             };
-            scribe_cfg.vad_silence_threshold_secs = match track_id {
-                TrackId::Outgoing => 1.5, // mic → TTS: complete sentences
-                TrackId::Incoming => 1.0, // subtitles: lower latency
-            };
+            scribe_cfg.vad = cfg.vad_preset;
             let (h, ev) = ScribeClient::spawn(scribe_cfg, track_id);
             (SttHandle::Scribe(h), ev)
         }

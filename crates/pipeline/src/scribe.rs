@@ -26,6 +26,50 @@ use tokio_tungstenite::{
 use crate::events::{PipelineEvent, TrackId};
 use crate::PipelineError;
 
+/// VAD tuning for Scribe's server-side auto-commit. Pick one of the const
+/// presets; all four fields travel together so a preset is a single
+/// substitution, not scattered conditionals.
+#[derive(Debug, Clone, Copy)]
+pub struct VadPreset {
+    /// Seconds of silence before the VAD commits an utterance (0.3–3.0).
+    pub silence_threshold_secs: f64,
+    /// Speech-detection sensitivity (0.1–0.9). Lower = more sensitive.
+    pub threshold: f64,
+    /// Speech bursts shorter than this are ignored (50–2000 ms).
+    pub min_speech_duration_ms: u32,
+    /// Silence gaps shorter than this are ignored (50–2000 ms).
+    pub min_silence_duration_ms: u32,
+}
+
+impl VadPreset {
+    /// ElevenLabs defaults — complete sentences, higher latency.
+    pub const DEFAULT: Self = Self {
+        silence_threshold_secs: 1.5,
+        threshold: 0.4,
+        min_speech_duration_ms: 100,
+        min_silence_duration_ms: 100,
+    };
+
+    /// Regular conversation: commits on natural sentence pauses.
+    pub const SLOW_SPEECH: Self = Self {
+        silence_threshold_secs: 1.0,
+        ..Self::DEFAULT
+    };
+
+    /// Rapid/news speech: short pauses count as silence so fast speakers
+    /// don't accumulate multi-sentence chunks.
+    pub const FAST_SPEECH: Self = Self {
+        silence_threshold_secs: 0.5,
+        min_speech_duration_ms: 50,
+        min_silence_duration_ms: 50,
+        ..Self::DEFAULT
+    };
+}
+
+impl Default for VadPreset {
+    fn default() -> Self { Self::DEFAULT }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScribeConfig {
     pub api_key: String,
@@ -33,9 +77,8 @@ pub struct ScribeConfig {
     /// ISO 639-1/639-3 language code (e.g. `"en"`, `"zho"`). `None` =
     /// server-side automatic language detection.
     pub language_code: Option<String>,
-    /// Seconds of silence before the VAD commits an utterance. Lower =
-    /// lower latency, higher = more complete sentences.
-    pub vad_silence_threshold_secs: f64,
+    /// Server-side VAD auto-commit tuning.
+    pub vad: VadPreset,
     pub endpoint: String,
 }
 
@@ -45,7 +88,7 @@ impl ScribeConfig {
             api_key,
             model: "scribe_v2_realtime".into(),
             language_code: None,
-            vad_silence_threshold_secs: 1.5,
+            vad: VadPreset::DEFAULT,
             endpoint: "wss://api.elevenlabs.io/v1/speech-to-text/realtime".into(),
         }
     }
@@ -66,7 +109,16 @@ impl ScribeConfig {
             ("filter_background_audio", "true".into()),
             (
                 "vad_silence_threshold_secs",
-                format!("{}", self.vad_silence_threshold_secs),
+                format!("{}", self.vad.silence_threshold_secs),
+            ),
+            ("vad_threshold", format!("{}", self.vad.threshold)),
+            (
+                "min_speech_duration_ms",
+                format!("{}", self.vad.min_speech_duration_ms),
+            ),
+            (
+                "min_silence_duration_ms",
+                format!("{}", self.vad.min_silence_duration_ms),
             ),
         ];
         if let Some(ref lang) = self.language_code {
@@ -340,6 +392,9 @@ mod tests {
             "audio_format=pcm_16000",
             "commit_strategy=vad",
             "vad_silence_threshold_secs=1.5",
+            "vad_threshold=0.4",
+            "min_speech_duration_ms=100",
+            "min_silence_duration_ms=100",
             "filter_background_audio=true",
         ] {
             assert!(url.contains(needle), "missing {needle} in {url}");

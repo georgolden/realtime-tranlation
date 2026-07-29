@@ -185,6 +185,13 @@ pub const T2_SOURCES: &[(&str, &str)] = &[
     ("input",  "Input (your microphone)"),
 ];
 
+// ── Track 2 (subtitles) Scribe VAD speech-pace presets ─────────────────────
+
+pub const T2_SPEECH_PACES: &[(&str, &str)] = &[
+    ("slow", "Slow / conversation"),
+    ("fast", "Fast (news, rapid speech)"),
+];
+
 // ── Main state struct ──────────────────────────────────────────────────────
 
 pub struct UiState {
@@ -207,6 +214,8 @@ pub struct UiState {
     pub track2_enabled:       bool,
     /// Index into T2_SOURCES — where the subtitles track captures from.
     pub t2_source_idx:        usize,
+    /// Index into T2_SPEECH_PACES — Scribe VAD preset for the subtitles track.
+    pub t2_pace_idx:          usize,
     pub context_sentences:    usize,
     /// Index into STT_PROVIDERS — which STT backend tracks use.
     pub stt_provider_idx:     usize,
@@ -282,6 +291,10 @@ impl UiState {
             t2_source_idx:       T2_SOURCES
                 .iter()
                 .position(|(id, _)| *id == cfg.t2_source.as_str())
+                .unwrap_or(0),
+            t2_pace_idx:         T2_SPEECH_PACES
+                .iter()
+                .position(|(id, _)| *id == cfg.t2_speech_pace.as_str())
                 .unwrap_or(0),
             stt_provider_idx:    STT_PROVIDERS
                 .iter()
@@ -449,6 +462,14 @@ impl UiState {
             .get(self.t2_source_idx)
             .map(|(id, _)| *id)
             .unwrap_or("output")
+    }
+
+    /// Selected Track 2 speech pace id (`"slow"` or `"fast"`).
+    pub fn t2_speech_pace(&self) -> &str {
+        T2_SPEECH_PACES
+            .get(self.t2_pace_idx)
+            .map(|(id, _)| *id)
+            .unwrap_or("slow")
     }
 
     /// Selected mic node id.

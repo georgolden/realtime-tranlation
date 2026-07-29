@@ -23,7 +23,7 @@ pub use elevenlabs::{elevenlabs_spawn, ElevenLabsConfig};
 pub use events::{PipelineEvent, TrackId};
 pub use gemini::{bcp47_from_deepl, GeminiClient, GeminiConfig, GeminiHandle, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE};
 pub use resample::{resample_to_deepgram, ResampleState};
-pub use scribe::{ScribeClient, ScribeConfig, ScribeHandle};
+pub use scribe::{ScribeClient, ScribeConfig, ScribeHandle, VadPreset};
 pub use transcript::{FlushReason, TranscriptBuffer, TranscriptBufferConfig};
 
 use std::sync::Once;
